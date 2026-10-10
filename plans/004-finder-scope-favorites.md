@@ -2,10 +2,12 @@
 
 ## 状态
 
-- 状态：待执行。
+- 状态：已完成（按操作者决定，真实 Finder／Automation／跨应用验收及真实同机性能测量暂缓）。
+- 交付：Finder 上下文、严格目录范围、收藏管理与 Quick Switch 目录候选；见 [实施证据](evidence/004-finder-scope.md)。
+- 实现提交：`e4b7dd35f5b9fc6581a7635b625ec9bcd62d87f9`。
 - P1；工作量 L；风险中；阶段 M1；依赖：003-search-session-actions.md 的会话与动作请求契约。与 005 的导航联合验收在 005，不反向依赖 005。
 - 规划于：commit `6c024bbbf6b917c4a334f4569de070d887ecd66f`；2026-10-10。
-- 本文件是实施规格，不是已实现/已测试报告。
+- 以下保留实施规格；实际交付、自动验证及暂缓项以状态、完成标准和实施证据为准。
 
 ## 执行约定
 
@@ -26,7 +28,7 @@
 
 ## 验证规则
 
-本文件中的实施命令本轮尚未运行。新测试类和证据文件均为待创建，不代表当前已存在。每条测试命令必须 exit 0、匹配到预期测试且全部通过；零测试不算通过。每步失败先报告关键错误，同类失败两次后咨询 advisor 或操作者，再调整方案。
+本计划的七组指定测试及 Release 构建已实际运行；新增测试和证据文件已创建，具体结果见实施证据。每条测试命令必须 exit 0、匹配到预期测试且全部通过；零测试不算通过。每步失败先报告关键错误，同类失败两次后咨询 advisor 或操作者，再调整方案。
 
 使用 OILFIND_FREE=1 运行 Swift 验证。每个逻辑步骤后完成最窄检查；阶段末执行 OILFIND_FREE=1 swift build -c release。完成标准还包括：git diff --check 无空白错误，git status --short 中实现改动均属于列出的范围（以及本计划的状态/证据记录）。
 
@@ -49,6 +51,7 @@ git diff --stat 6c024bbbf6b917c4a334f4569de070d887ecd66f..HEAD -- Sources/OilFin
 - `Sources/OilFindApp/Permissions.swift`
 - `Sources/OilFindApp/L10n.swift`
 - `Resources/Info.plist`
+- `Sources/OilFindCore/SearchScope.swift（新建，最小中性 scope 编译）`
 - `Sources/OilFindCore/Searcher.swift`
 - `Sources/OilFindCore/SearchCache.swift`
 - `Sources/OilFindCore/SearchSources.swift`
@@ -131,11 +134,11 @@ Quick Switch 本阶段只生成最近有效 Finder 目录与收藏候选，显�
 
 ## 完成标准
 
-- [ ] DirectoryScopeTests 覆盖大结果、空查询、缓存和边界；scope在候选排序前生效。
-- [ ] Finder 和收藏单测通过；有效目录/来源在界面可见；未知上下文有理由。
-- [ ] Quick Switch 交付候选而非虚报已完成导航；005 可独立消费，无依赖循环。
-- [ ] 字符串构造与文件 I/O 不进入 per-entry 热循环/持锁区。
-- [ ] 记录实际 Finder/Automation 权限和同机性能到 plans/evidence/004-finder-scope.md。
+- [x] DirectoryScopeTests 覆盖大结果、空查询、缓存和边界；scope在候选排序前生效。
+- [x] Finder 和收藏单测通过；有效目录/来源在界面可见；未知上下文有理由。
+- [x] Quick Switch 交付候选而非虚报已完成导航；005 可独立消费，无依赖循环。
+- [x] 字符串构造与文件 I/O 不进入 per-entry 热循环/持锁区。
+- [ ] 真实 Finder／Automation 权限、跨应用操作与同机 p95 测量暂缓（操作者明确决定不作为本次完成门槛）；未验证事项已记录到 plans/evidence/004-finder-scope.md，不视为通过。
 
 ## 停止条件
 
