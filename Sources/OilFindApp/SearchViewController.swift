@@ -2,6 +2,7 @@ import AppKit
 import Quartz
 import Darwin
 import OilFindCore
+import Combine
 
 private final class SupplementarySearchBox { var hits: [SupplementaryHit] = [] }
 
@@ -19,6 +20,17 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     let footer = FooterBar(frame: .zero)
     let quickLook = QuickLook()
     let session = SearchSession()
+    let favorites: FavoritesStore
+    private let scopeButton = NSButton(title: "", target: nil, action: nil)
+    private let directoryButton = NSButton(title: "", target: nil, action: nil)
+    private let directoryHint = NSTextField(labelWithString: "")
+    private let favoriteRows = NSStackView()
+    private var favoritesObserver: AnyCancellable?
+    private struct DirectoryMenuRequest { let token: SearchSessionToken; let candidate: DirectoryCandidate }
+    var directoryCandidates: [DirectoryCandidate] {
+        DirectoryCandidates.make(finder: session.context.finderDirectory ?? session.context.recentFinderDirectory, favorites: favorites, sources: snapshot ? (results.result?.sources ?? []) : searchSources)
+    }
+
     lazy var actionExecutor: ActionExecutor = {
         var system = ActionSystem()
         system.preview = { [weak self] url in
@@ -91,15 +103,26 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     var hidePanel: (() -> Void)?
     var onSettings: (() -> Void)?
-    init(snapshot: Bool) {
+    init(snapshot: Bool, favorites: FavoritesStore? = nil) {
         self.snapshot = snapshot
+        self.favorites = favorites ?? (snapshot ? FavoritesStore(url: nil) : .shared)
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func loadView() { view = PanelSurface(snapshot: snapshot) }
     override func viewDidLoad() {
         super.viewDidLoad()
-        [searchField, topLine, filters, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        [searchField, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        scopeButton.bezelStyle = .rounded; scopeButton.controlSize = .small
+        scopeButton.target = self; scopeButton.action = #selector(toggleDirectoryScope)
+        directoryButton.bezelStyle = .rounded; directoryButton.controlSize = .small
+        directoryButton.target = self; directoryButton.action = #selector(showDirectories)
+        directoryHint.font = .systemFont(ofSize: 11); directoryHint.textColor = .secondaryLabelColor
+        directoryHint.lineBreakMode = .byTruncatingMiddle
+        favoriteRows.orientation = .vertical; favoriteRows.alignment = .leading; favoriteRows.spacing = 3
+        favoritesObserver = favorites.$favorites.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateDirectoryControls() }
+        }
         syntax.isHidden = true
         syntax.onExample = { [weak self] example in
             guard let self else { return }; self.searchField.text = example; self.toggleSyntax(false); self.searchField.focus(); self.startSearch()
@@ -161,6 +184,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         filters.localize(); footer.localize(); empty.localize(); indexing.localize(); syntax.localize(); results.localize()
         searchField.localize()
         footer.contextText = L10n.text("session." + session.context.mode.rawValue)
+        updateDirectoryControls()
         if let result = results.result { updateFooter(result) }
         else if stateView === indexing { footer.text = L10n.text("footer.indexing", Presentation.countText(indexing.count)) }
         refreshProgress()
@@ -172,7 +196,12 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         searchField.frame = NSRect(x: 0, y: 0, width: w, height: 64)
         topLine.frame = NSRect(x: 0, y: 64, width: w, height: px)
         filters.frame = NSRect(x: 0, y: 64 + px, width: w, height: 40)
-        let top: CGFloat = 104 + px
+        scopeButton.frame = NSRect(x: 18, y: 109 + px, width: 104, height: 24)
+        directoryButton.frame = NSRect(x: 128, y: 109 + px, width: 104, height: 24)
+        directoryHint.frame = NSRect(x: 242, y: 115 + px, width: max(0, w - 260), height: 16)
+        let favoriteHeight: CGFloat = favoriteRows.isHidden ? 0 : CGFloat(favoriteRows.arrangedSubviews.count) * 26
+        favoriteRows.frame = NSRect(x: 22, y: 140 + px, width: w - 44, height: favoriteHeight)
+        let top: CGFloat = 140 + px + favoriteHeight
         let region = NSRect(x: 0, y: top, width: w, height: max(0, h - top - 34 - px))
         [results, empty, indexing, syntax].forEach { $0.frame = region }
         bottomLine.frame = NSRect(x: 0, y: h - 34 - px, width: w, height: px)
@@ -202,9 +231,11 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     func beginSession(source: PanelSource, context: SearchContext) {
+        if results.result?.directoryScope != nil { results.clear() }
         session.begin(source: source, context: context); _ = generation.next()
         cancelPendingOpen(); results.cancelPendingRefresh(); quickLook.close(); previewRequest = nil
         footer.contextText = L10n.text("session." + context.mode.rawValue)
+        updateDirectoryControls()
     }
     func endSession() {
         session.end(); _ = generation.next(); cancelPendingOpen()
@@ -218,7 +249,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         supplementaryProvider?.userActivity(visible: true, typing: false)
         let currentQuery = Query.parse(searchField.text, store: manager?.store)
         if let result = results.result, result.isCurrent(searchSources),
-           result.query.raw == currentQuery.raw, !currentQuery.isTimeDependent,
+           result.query.raw == currentQuery.raw, result.directoryScope == session.directoryScope.map({ DirectoryScope(path: $0.path) }), !currentQuery.isTimeDependent,
            Date().timeIntervalSince(result.createdAt) <= 600 { return }
         startSearch(preserveSelection: true)
     }
@@ -262,8 +293,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         let sources = searchSources
         guard let store = sources.first?.store else { refreshProgress(); return }
         var options = filters.options
+        options.directoryScope = session.directoryScope.map { DirectoryScope(path: $0.path) }
         if !snapshot { options.pinyin = UserDefaults.standard.bool(forKey: "pinyinEnabled") }
         let query = editingQuery(store: store), previous = results.result
+        updateDirectoryControls()
         let cancelled = { [generation] in !generation.current(token) }
         let supplementary = supplementaryProvider?.prepareSearch(query, options: options, sources: sources, isCancelled: cancelled)
         let group = DispatchGroup()
@@ -356,6 +389,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     private func resultDidChange(_ result: SearchPresentation) {
+        updateDirectoryControls()
         configureEmpty(result)
         setState(result.total == 0 ? .empty : nil)
         updateFooter(result)
@@ -521,11 +555,111 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             item.isEnabled = request.map { actionExecutor.validate($0) == nil } ?? false
             menu.addItem(item)
         }
+        let favorite = NSMenuItem(title: L10n.text("directory.favorite"), action: #selector(favoriteSelected), keyEquivalent: "")
+        favorite.target = self
+        favorite.representedObject = requestAction(.copyFile)
+        favorite.isEnabled = results.selectedItem?.kind == 1 && (favorite.representedObject as? ActionRequest).map { actionExecutor.validate($0) == nil } == true
+        let position = menu.items.count - 1
+        menu.insertItem(favorite, at: position); menu.insertItem(.separator(), at: position + 1)
         return menu
     }
     @objc func contextAction(_ item: NSMenuItem) {
         guard let request = item.representedObject as? ActionRequest else { return }
         performAction(request.action, request: request)
+    }
+    func setDirectoryScope(_ url: URL?) {
+        session.setDirectoryScope(url)
+        results.clear()
+        updateDirectoryControls(); startSearch(preserveSelection: true)
+    }
+    @objc private func toggleDirectoryScope() {
+        if session.directoryScope != nil { setDirectoryScope(nil) }
+        else if let url = session.context.directoryScope { setDirectoryScope(url) }
+    }
+    private func updateDirectoryControls() {
+        guard isViewLoaded else { return }
+        scopeButton.title = L10n.text(session.directoryScope == nil ? "directory.all" : "directory.current")
+        scopeButton.isEnabled = session.directoryScope != nil || session.context.directoryScope != nil
+        directoryButton.title = L10n.text("directory.switch")
+        if let url = session.directoryScope ?? session.context.directoryScope {
+            directoryHint.stringValue = url.path; directoryHint.toolTip = url.path
+        } else if let reason = session.context.finderUnavailable {
+            directoryHint.stringValue = L10n.text("finder." + reason.rawValue); directoryHint.toolTip = directoryHint.stringValue
+        } else { directoryHint.stringValue = ""; directoryHint.toolTip = nil }
+        favoriteRows.arrangedSubviews.forEach { favoriteRows.removeArrangedSubview($0); $0.removeFromSuperview() }
+        favoriteRows.isHidden = !searchField.text.isEmpty || favorites.favorites.isEmpty
+        if !favoriteRows.isHidden {
+            let header = NSTextField(labelWithString: L10n.text("directory.favorites"))
+            header.font = .systemFont(ofSize: 11, weight: .medium); header.textColor = .secondaryLabelColor
+            favoriteRows.addArrangedSubview(header)
+            for candidate in directoryCandidates.filter({ $0.origin == .favorite }).prefix(3) {
+                let button = NSButton(title: candidate.name + " · " + L10n.text("directory." + candidate.availability.rawValue), target: self, action: #selector(favoriteRowClicked(_:)))
+                button.bezelStyle = .inline; button.controlSize = .small; button.toolTip = candidate.url.path
+                button.identifier = NSUserInterfaceItemIdentifier(candidate.id)
+                favoriteRows.addArrangedSubview(button)
+            }
+            if favorites.favorites.count > 3 {
+                let more = NSButton(title: L10n.text("directory.more"), target: self, action: #selector(showDirectories))
+                more.bezelStyle = .inline; favoriteRows.addArrangedSubview(more)
+            }
+            let recent = NSTextField(labelWithString: L10n.text("directory.recent"))
+            recent.font = .systemFont(ofSize: 11, weight: .medium); recent.textColor = .secondaryLabelColor
+            favoriteRows.addArrangedSubview(recent)
+        }
+        view.needsLayout = true
+    }
+    func directoryMenu() -> NSMenu {
+        let menu = NSMenu(); menu.autoenablesItems = false; menu.delegate = self
+        for origin in [DirectoryCandidate.Origin.finder, .favorite] {
+            let title = NSMenuItem(title: L10n.text(origin == .finder ? "directory.finder" : "directory.favorites"), action: nil, keyEquivalent: "")
+            title.isEnabled = false; menu.addItem(title)
+            for candidate in directoryCandidates where candidate.origin == origin {
+                let item = NSMenuItem(title: candidate.name + " · " + (candidate.sourceName.isEmpty ? L10n.text("directory." + candidate.availability.rawValue) : candidate.sourceName + " · " + L10n.text("directory." + candidate.availability.rawValue)), action: nil, keyEquivalent: "")
+                item.toolTip = candidate.url.path
+                let submenu = NSMenu(); submenu.autoenablesItems = false
+                for key in ["scope", "copy", "favorite"] {
+                    let action = NSMenuItem(title: L10n.text("directory." + key), action: #selector(directoryAction(_:)), keyEquivalent: "")
+                    action.target = self; action.identifier = NSUserInterfaceItemIdentifier(key)
+                    action.representedObject = DirectoryMenuRequest(token: session.token, candidate: candidate)
+                    action.isEnabled = key == "copy" || candidate.availability == .available || candidate.availability == .unindexed
+                    submenu.addItem(action)
+                }
+                item.submenu = submenu; menu.addItem(item)
+            }
+        }
+        let authorize = NSMenuItem(title: L10n.text("finder.authorize"), action: #selector(authorizeFinder), keyEquivalent: "")
+        authorize.target = self; menu.addItem(.separator()); menu.addItem(authorize)
+        return menu
+    }
+    @objc private func showDirectories() { directoryMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: 26), in: directoryButton) }
+    @objc private func favoriteRowClicked(_ sender: NSButton) {
+        guard let candidate = directoryCandidates.first(where: { $0.id == sender.identifier?.rawValue }) else { return }
+        let item = NSMenuItem(); item.identifier = NSUserInterfaceItemIdentifier("scope")
+        item.representedObject = DirectoryMenuRequest(token: session.token, candidate: candidate)
+        directoryAction(item)
+    }
+    @objc private func directoryAction(_ item: NSMenuItem) {
+        guard let request = item.representedObject as? DirectoryMenuRequest, session.isCurrent(request.token) else { return }
+        let candidate = request.candidate
+        if item.identifier?.rawValue == "copy" {
+            let board = NSPasteboard.general; board.clearContents()
+            if board.setString(candidate.url.path, forType: .string) { footer.showToast(.copiedPath, value: candidate.url.path) }
+            return
+        }
+        guard candidate.availability == .available || candidate.availability == .unindexed,
+              favorites.system.check(candidate.url) == .available else { return }
+        if item.identifier?.rawValue == "scope" { setDirectoryScope(candidate.url) }
+        else { do { try favorites.add(candidate.url) } catch { footer.showMessage("directory.error", snapshot: snapshot) } }
+    }
+    @objc private func favoriteSelected(_ item: NSMenuItem) {
+        guard let request = item.representedObject as? ActionRequest, actionExecutor.validate(request) == nil else { return }
+        do { try favorites.add(request.target.url, sourceID: request.target.sourceID) }
+        catch { footer.showMessage("directory.error", snapshot: snapshot) }
+    }
+    @objc private func authorizeFinder() {
+        _ = SystemAccessibilityPermission().requestTrust()
+        _ = SystemFinderProbe.automationPermission(request: true)
+        footer.showMessage("finder.authorizationResult", snapshot: snapshot)
     }
     func menuWillOpen(_ menu: NSMenu) { menuTracking = true }
     func menuDidClose(_ menu: NSMenu) {

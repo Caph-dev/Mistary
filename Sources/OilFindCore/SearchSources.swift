@@ -45,13 +45,14 @@ public enum MultiSearcher {
         func searchSource(_ i: Int) {
             let source = sources[i]
             if isCancelled() { return }
-            if let cached = caches[source.id]?.lookup(query: query, options: options, store: source.store) { slots[i] = cached; return }
+            let binding = caches[source.id]?.bind(to: source)
+            if let cached = caches[source.id]?.lookup(query: query, options: options, store: source.store, binding: binding) { slots[i] = cached; return }
             let old = previous.flatMap { result -> SearchResult? in
-                guard let position = result.sources.firstIndex(where: { $0.id == source.id && $0.store === source.store }) else { return nil }
+                guard let position = result.sources.firstIndex(where: { $0.id == source.id && $0.store === source.store && $0.isOnline == source.isOnline }) else { return nil }
                 return result.results[position]
             }
             slots[i] = Searcher.search(query, options: options, in: source.store, previous: old, isCancelled: isCancelled)
-            if let result = slots[i] { caches[source.id]?.insert(result) }
+            if let result = slots[i] { caches[source.id]?.insert(result, binding: binding) }
         }
         if sources.count == 1 { searchSource(0) }
         else { DispatchQueue.concurrentPerform(iterations: sources.count, execute: searchSource) }

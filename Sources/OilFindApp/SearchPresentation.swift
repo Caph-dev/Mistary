@@ -11,6 +11,7 @@ final class SearchPresentation {
     let createdAt: Date
     init(_ result: SearchResult) { single = result; multiple = nil; createdAt = result.createdAt }
     init(_ result: MultiSearchResult) { single = nil; multiple = result; createdAt = result.createdAt }
+    var directoryScope: DirectoryScope? { single?.options.directoryScope ?? multiple?.results.first?.options.directoryScope }
     var query: Query { single?.query ?? multiple!.query }
     var total: Int { supplementedRows?.count ?? single?.total ?? multiple!.total }
     var sortedCount: Int { supplementedRows?.count ?? single?.sortedCount ?? multiple!.sortedCount }
@@ -38,7 +39,13 @@ final class SearchPresentation {
             var rows = (0..<count).compactMap { row($0) }
             var seen = Dictionary(grouping: rows, by: { $0.source.id }).mapValues { Set($0.map(\.id)) }
             var extra: [(source: SearchSource, id: UInt32)] = []
+            let allowed = Dictionary(uniqueKeysWithValues: captured.map { source in
+                (source.id, Searcher.withDirectoryScope(options.directoryScope, in: source.store) { contains in
+                    Set(hits.filter { $0.sourceID == source.id && contains($0.entryID) }.map(\.entryID))
+                })
+            })
             for hit in hits {
+                guard allowed[hit.sourceID]?.contains(hit.entryID) == true else { continue }
                 guard let source = sources.first(where: { $0.id == hit.sourceID }), Int(hit.entryID) < source.store.count && source.store.isLive(hit.entryID) else { continue }
                 result.details[source.id, default: [:]][hit.entryID] = hit
                 if seen[source.id, default: []].insert(hit.entryID).inserted { extra.append((source, hit.entryID)) }

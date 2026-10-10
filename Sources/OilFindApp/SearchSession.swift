@@ -13,6 +13,9 @@ struct SearchContext {
     let mode: SearchMode
     let target: SearchContextTarget?
     let directoryScope: URL?
+    var finderDirectory: FinderDirectory? = nil
+    var finderUnavailable: FinderUnavailable? = nil
+    var recentFinderDirectory: FinderDirectory? = nil
     static let ordinary = SearchContext(mode: .ordinary, target: nil, directoryScope: nil)
 }
 
@@ -30,11 +33,15 @@ final class SearchSession {
     private(set) var invocationSource: PanelSource = .indexing
     private(set) var context = SearchContext.ordinary
     private(set) var isActive = true
+    private(set) var directoryScope: URL? = nil
     var token: SearchSessionToken { SearchSessionToken(sessionID: sessionID, queryGeneration: queryGeneration, actionGeneration: actionGeneration) }
 
     func begin(source: PanelSource, context: SearchContext) {
         sessionID = UUID(); queryGeneration = 0; actionGeneration = 0
-        invocationSource = source; self.context = context; isActive = true
+        invocationSource = source; self.context = context; directoryScope = nil; isActive = true
+    }
+    func setDirectoryScope(_ url: URL?) {
+        directoryScope = url?.standardizedFileURL; queryChanged()
     }
     func queryChanged() { queryGeneration &+= 1; invalidateActions() }
     func invalidateActions() { actionGeneration &+= 1 }

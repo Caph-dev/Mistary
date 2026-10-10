@@ -7,8 +7,9 @@ public struct SearchOptions {
     public var ascending: Bool = false
     public var kind: UInt8? = nil
     public var pinyin: Bool = true
-    public init(sort: SortKey = .relevance, ascending: Bool = false, kind: UInt8? = nil, pinyin: Bool = true) {
-        self.sort = sort; self.ascending = ascending; self.kind = kind; self.pinyin = pinyin
+    public var directoryScope: DirectoryScope? = nil
+    public init(sort: SortKey = .relevance, ascending: Bool = false, kind: UInt8? = nil, pinyin: Bool = true, directoryScope: DirectoryScope? = nil) {
+        self.sort = sort; self.ascending = ascending; self.kind = kind; self.pinyin = pinyin; self.directoryScope = directoryScope
     }
 }
 public final class SearchResult {
@@ -84,6 +85,7 @@ private final class SearchPlan {
     var regexes: [NSRegularExpression] = []
     var drivers: [DriverNeedle]?
     var rootBytes: [UInt8] = []
+    var scope: CompiledDirectoryScope!
     var allowedKinds: UInt16 = 0x1ff
     var requiredPath: UnsafePointer<UInt8>?
     var canBatchName: Bool {
@@ -185,6 +187,15 @@ private final class SearchScratch {
 }
 
 public enum Searcher {
+    public static func directoryScopeIsAvailable(_ scope: DirectoryScope, in store: IndexStore) -> Bool {
+        store.read { CompiledDirectoryScope(scope, store: store).isAvailable }
+    }
+    public static func withDirectoryScope<T>(_ scope: DirectoryScope?, in store: IndexStore, _ body: ((UInt32) -> Bool) -> T) -> T {
+        store.read {
+            let compiled = CompiledDirectoryScope(scope, store: store)
+            return body { id in Int(id) < store.count && store.isLive(id) && compiled.contains(id, store: store) }
+        }
+    }
     /// Evaluate existing query atoms against captured entries under one read lock.
     /// The callback is synchronous; predicate indexes correspond to the input atoms.
     public static func withEntryPredicates<T>(_ atoms: [Atom], options: SearchOptions = SearchOptions(), in store: IndexStore,
@@ -192,10 +203,11 @@ public enum Searcher {
         store.read {
             let query = Query(clauses: atoms.map { Clause(alternatives: [$0]) }, raw: "")
             let plan = makePlan(query, store: store, pinyin: options.pinyin, preserveOrder: true)
+            plan.scope = CompiledDirectoryScope(options.directoryScope, store: store)
             let scratch = SearchScratch(streamCount: 0, chunkSize: 0, needsCandidates: false, needsScanOut: false, needsScoreOut: false)
             return plan.atoms.withUnsafeBufferPointer { pointer in
                 body { ordinal, id in
-                    guard ordinal >= 0, ordinal < pointer.count, Int(id) < store.count, store.isLive(id), !isCancelled() else { return false }
+                    guard ordinal >= 0, ordinal < pointer.count, Int(id) < store.count, store.isLive(id), plan.scope.contains(id, store: store), !isCancelled() else { return false }
                     return matchHot(pointer.baseAddress!.advanced(by: ordinal), id: id, plan: plan, options: options, store: store, scratch: scratch, scoreNeeded: false, isCancelled: isCancelled).matched
                 }
             }
@@ -210,6 +222,7 @@ public enum Searcher {
             let narrowed = previous.map { canNarrow(query, options: options, store: store, previous: $0) } ?? false
             let candidateCount = narrowed ? previous!.items.count : store.count - 1
             let plan = makePlan(query, store: store, pinyin: options.pinyin)
+            plan.scope = CompiledDirectoryScope(options.directoryScope, store: store)
             let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
             let chunkSize = narrowed ? 65536 : max(65536, store.count / (cores * 4))
             let chunkCount = max(0, (candidateCount + chunkSize - 1) / chunkSize)
@@ -307,6 +320,7 @@ public enum Searcher {
 
     private static func canNarrow(_ query: Query, options: SearchOptions, store: IndexStore, previous: SearchResult) -> Bool {
         guard previous.store === store, previous.storeVersion == store.version,
+              previous.options.directoryScope == options.directoryScope,
               previous.options.kind == options.kind, previous.options.pinyin == options.pinyin,
               !previous.query.isEmpty, !previous.query.isTimeDependent,
               query.clauses.count >= previous.query.clauses.count else { return false }
@@ -329,6 +343,7 @@ public enum Searcher {
     }
 
     private static func recent(_ query: Query, options: SearchOptions, store: IndexStore, started: CFAbsoluteTime, isCancelled: () -> Bool) -> SearchResult? {
+        let scope = CompiledDirectoryScope(options.directoryScope, store: store)
         var heap: [Ranked] = []
         heap.reserveCapacity(200)
         let recentOptions = SearchOptions(sort: .modified)
@@ -337,6 +352,7 @@ public enum Searcher {
             if start > 1 && isCancelled() { return nil }
             let end = min(start + 4096, store.count)
             for i in start..<end {
+                if !scope.contains(UInt32(i), store: store) { continue }
                 let flags = store.flags[i]
                 if flags & (SiftFlag.deleted | SiftFlag.noise | SiftFlag.inPackage | SiftFlag.hidden) != 0 || flags & SiftFlag.userArea == 0 || store.kind[i] == 1 { continue }
                 if let kind = options.kind, store.kind[i] != kind { continue }
@@ -557,7 +573,7 @@ public enum Searcher {
                 sift_score_name_batch(ids.baseAddress, ids.count, store.names, store.nameOff, store.flags, store.kind, store.depth, store.mtime, atom.bytes, atom.length, atom.flag ? 1 : 0, now, scoreOut)
                 for j in 0..<ids.count {
                     let id = ids[j], i = Int(id)
-                    if store.flags[i] & SiftFlag.deleted != 0 { continue }
+                    if store.flags[i] & SiftFlag.deleted != 0 || !plan.scope.contains(id, store: store) { continue }
                     if let kind = options.kind, store.kind[i] != kind { continue }
                     let score = scoreOut[j]
                     if score == OILFIND_SCORE_NO_MATCH { continue }
@@ -591,7 +607,7 @@ public enum Searcher {
                         }
                         for j in 0..<ids.count {
                             let id = ids[j], i = Int(id)
-                            if store.flags[i] & SiftFlag.deleted != 0 { continue }
+                            if store.flags[i] & SiftFlag.deleted != 0 || !plan.scope.contains(id, store: store) { continue }
                             if let kind = options.kind, store.kind[i] != kind { continue }
                             let score = scoreOut[j]
                             if score == OILFIND_SCORE_NO_MATCH { continue }
@@ -692,7 +708,7 @@ public enum Searcher {
 
     private static func evaluateHot(id: UInt32, atoms: UnsafePointer<HotAtom>, clauses: UnsafePointer<ClauseRange>, clauseCount: Int, plan: SearchPlan, options: SearchOptions, store: IndexStore, now: UInt32, scratch: SearchScratch, isCancelled: () -> Bool) -> Ranked? {
         let i = Int(id), flags = store.flags[i]
-        if flags & SiftFlag.deleted != 0 { return nil }
+        if flags & SiftFlag.deleted != 0 || !plan.scope.contains(id, store: store) { return nil }
         if let kind = options.kind, store.kind[i] != kind { return nil }
         let scoreNeeded = options.sort == .relevance
         var baseSum = 0, baseCount = 0, needleLength = 0

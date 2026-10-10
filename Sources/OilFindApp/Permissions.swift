@@ -14,12 +14,12 @@ struct SystemAccessibilityPermission: AccessibilityPermissionChecking {
 struct PermissionStatus {
     let fullDiskAccess: Bool
     let accessibility: Bool
-    let automation: String = "notRequested"
+    let automation: String
 }
 
 enum Permissions {
     static func status(accessibility: AccessibilityPermissionChecking = SystemAccessibilityPermission()) -> PermissionStatus {
-        PermissionStatus(fullDiskAccess: hasFullDiskAccess(), accessibility: accessibility.isTrusted())
+        PermissionStatus(fullDiskAccess: hasFullDiskAccess(), accessibility: accessibility.isTrusted(), automation: SystemFinderProbe.automationPermission() == noErr ? "granted" : "notGranted")
     }
     static func hasFullDiskAccess() -> Bool {
         let path = NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db"

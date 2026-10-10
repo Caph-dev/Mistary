@@ -13,16 +13,29 @@ public final class SearchCache {
     // Oldest first; a small bounded array avoids a second set of key allocations.
     private var entries: [Entry] = []
     private var itemCount = 0
+    private var bindingGeneration: UInt64 = 0
+    private var sourceBinding: (id: String, store: ObjectIdentifier, online: Bool)?
 
     public init(maxEntries: Int = 32, maxItems: Int = 4_000_000, clock: @escaping () -> Date = { Date() }) {
         self.maxEntries = max(0, maxEntries); self.maxItems = max(0, maxItems)
         self.clock = clock
     }
 
-    public func lookup(query: Query, options: SearchOptions, store: IndexStore) -> SearchResult? {
+    func bind(to source: SearchSource) -> UInt64 {
+        os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+        let identity = ObjectIdentifier(source.store)
+        if sourceBinding == nil || sourceBinding!.id != source.id || sourceBinding!.store != identity || sourceBinding!.online != source.isOnline {
+            entries.removeAll(keepingCapacity: true); itemCount = 0; bindingGeneration &+= 1
+        }
+        sourceBinding = (source.id, identity, source.isOnline)
+        return bindingGeneration
+    }
+
+    public func lookup(query: Query, options: SearchOptions, store: IndexStore, binding: UInt64? = nil) -> SearchResult? {
         guard !query.isTimeDependent else { return nil }
         return store.read {
             os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+            guard binding == nil || binding == bindingGeneration else { return nil }
             let now = clock()
             discardExpired(now: now)
             discardStale(store: store)
@@ -33,10 +46,11 @@ public final class SearchCache {
         }
     }
 
-    public func insert(_ result: SearchResult) {
+    public func insert(_ result: SearchResult, binding: UInt64? = nil) {
         guard !result.query.isTimeDependent else { return }
         result.store.read {
             os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
+            guard binding == nil || binding == bindingGeneration else { return }
             let now = clock()
             discardExpired(now: now)
             discardStale(store: result.store)
@@ -53,11 +67,12 @@ public final class SearchCache {
 
     public func removeAll() {
         os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
-        entries.removeAll(keepingCapacity: true); itemCount = 0
+        entries.removeAll(keepingCapacity: true); itemCount = 0; bindingGeneration &+= 1
     }
 
     private func matches(_ result: SearchResult, query: Query, options: SearchOptions, store: IndexStore) -> Bool {
         result.store === store && result.storeVersion == store.version && result.query.raw == query.raw &&
+        result.options.directoryScope == options.directoryScope &&
         result.options.kind == options.kind && result.options.pinyin == options.pinyin &&
         result.options.sort == options.sort && result.options.ascending == options.ascending
     }

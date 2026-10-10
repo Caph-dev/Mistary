@@ -41,6 +41,8 @@
 	<string>Mistary 需要读取这里的文件名来建立搜索索引。</string>
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Mistary 需要读取这里的文件名来建立搜索索引。</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Mistary 仅在你授权后读取访达当前目录，用于目录范围和目录候选。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

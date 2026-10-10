@@ -8,6 +8,7 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var language: AppLanguage
     @Published var launchAtLogin: Bool
     let update: UpdateManager
+    let favorites: FavoritesStore
     private var languageObserver: NSObjectProtocol?
     private let languageDefaults: UserDefaults
     private var coverageExplanation: CoverageExplanation?
@@ -44,6 +45,7 @@ final class SettingsModel: ObservableObject {
 
     init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard) {
         self.snapshot = snapshot
+        self.favorites = snapshot ? FavoritesStore(url: nil) : .shared
         self.languageDefaults = languageDefaults
         self.language = L10n.language
         self.update = snapshot ? UpdateManager(snapshot: true) : .shared
@@ -200,6 +202,58 @@ final class SettingsModel: ObservableObject {
     }
 }
 
+private struct FavoriteSettingsSection: View {
+    @ObservedObject var store: FavoritesStore
+    let window: () -> NSWindow?
+    @State private var failed = false
+    var body: some View {
+        Section(L10n.text("directory.favorites")) {
+            ForEach(store.favorites) { entry in
+                FavoriteSettingsRow(store: store, entry: entry, failed: $failed)
+            }
+            Button(L10n.text("directory.add")) {
+                guard let window = window() else { return }
+                let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
+                panel.allowsMultipleSelection = false
+                panel.beginSheetModal(for: window) { response in
+                    guard response == .OK, let url = panel.url else { return }
+                    do { try store.add(url); failed = false } catch { failed = true }
+                }
+            }
+            if failed || store.error != nil { Text(L10n.text("directory.error")).font(.footnote).foregroundStyle(.secondary) }
+        }
+    }
+}
+
+private struct FavoriteSettingsRow: View {
+    @ObservedObject var store: FavoritesStore
+    let entry: FavoriteDirectory
+    @Binding var failed: Bool
+    @State private var name = ""
+    private func apply(_ work: () throws -> Void) {
+        do { try work(); failed = false } catch { failed = true }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                TextField(L10n.text("directory.rename"), text: $name)
+                    .onAppear { name = entry.name }
+                    .onChange(of: entry.name) { _, updated in name = updated }
+                Button(L10n.text("directory.save")) { apply { try store.rename(entry.id, to: name) } }
+                Button { apply { try store.move(entry.id, by: -1) } } label: { Image(systemName: "arrow.up") }
+                    .help(L10n.text("directory.up")).disabled(store.favorites.first?.id == entry.id)
+                Button { apply { try store.move(entry.id, by: 1) } } label: { Image(systemName: "arrow.down") }
+                    .help(L10n.text("directory.down")).disabled(store.favorites.last?.id == entry.id)
+                Button { apply { try store.remove(entry.id) } } label: { Image(systemName: "minus.circle") }
+                    .help(L10n.text("directory.remove"))
+            }
+            let resolved = store.resolve(entry)
+            Text(resolved.0.path + " · " + L10n.text("directory." + resolved.1.rawValue))
+                .font(.footnote).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).help(resolved.0.path)
+        }
+    }
+}
+
 private struct UpdateSettingsRow: View {
     @ObservedObject var update: UpdateManager
     var body: some View {
@@ -315,6 +369,7 @@ private struct SettingsForm: View {
                 scopeRow("system", key: "indexSystemDirs", enabled: model.indexSystemDirs)
             } header: { Text(L10n.text("settings.scope")) }
               footer: { hint(L10n.text("settings.scopeHint")) }
+            FavoriteSettingsSection(store: model.favorites, window: window)
             if let appExtension { appExtension.settingsSection(window: window) }
             Section {
                 if model.excludedPaths.isEmpty { Text(L10n.text("settings.noExcluded")).foregroundStyle(.secondary) }
