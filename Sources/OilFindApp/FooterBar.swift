@@ -26,24 +26,36 @@ final class FooterBar: FlippedView {
     private let toast = Theme.label(11.5, .regular, .labelColor)
     private var toastTimer: Timer?
     private var toastContent: (ToastKind, String)?
+    private var messageContent: (key: String, value: String)?
     private let status = Theme.label(11.5, .regular, .tertiaryLabelColor)
     private let hints = [KeyHint("↩", L10n.text("hint.open")), KeyHint("⌘↩", L10n.text("hint.reveal")), KeyHint("⌘Y", L10n.text("hint.preview")), KeyHint("⌘C", L10n.text("hint.copy"))]
     private let syntax = KeyHint("⌘/", L10n.text("hint.syntax"))
+    private let actions = KeyHint("⌘K", L10n.text("hint.actions"))
     var warning = false { didSet { status.textColor = warning ? .systemOrange : .tertiaryLabelColor; needsLayout = true } }
-    var text: String { get { status.stringValue } set { status.stringValue = newValue } }
+    private var statusContent = ""
+    var contextText = "" { didSet { updateStatus() } }
+    var text: String { get { statusContent } set { statusContent = newValue; updateStatus() } }
+    private func updateStatus() { status.stringValue = contextText.isEmpty ? statusContent : contextText + " · " + statusContent }
     var actionable = false { didSet { hints.forEach { $0.isHidden = !actionable }; needsLayout = true } }
     override init(frame: NSRect) {
         super.init(frame: frame)
         status.wantsLayer = true; toast.wantsLayer = true; toast.alphaValue = 0
         toast.lineBreakMode = .byTruncatingMiddle
-        addSubview(status); addSubview(toast); hints.forEach(addSubview); addSubview(syntax)
+        addSubview(status); addSubview(toast); hints.forEach(addSubview); addSubview(syntax); addSubview(actions)
         actionable = false
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    func showMessage(_ key: String, value: String = "", snapshot: Bool = false) {
+        toastContent = nil; messageContent = (key, value)
+        displayToast(L10n.text(key, value), snapshot: snapshot)
+    }
     func showToast(_ kind: ToastKind, value: String, snapshot: Bool = false) {
-        toastContent = (kind, value)
+        toastContent = (kind, value); messageContent = nil
+        displayToast(Presentation.toastText(kind, value: value, chinese: L10n.chinese), snapshot: snapshot)
+    }
+    private func displayToast(_ message: String, snapshot: Bool) {
         toastTimer?.invalidate()
-        toast.stringValue = Presentation.toastText(kind, value: value, chinese: L10n.chinese)
+        toast.stringValue = message
         let wasVisible = (toast.layer?.presentation()?.opacity ?? Float(toast.alphaValue)) > 0
         Theme.Motion.opacity(status, to: 0, using: snapshot ? nil : Theme.Motion.basic(Theme.Motion.toastIn))
         Theme.Motion.opacity(toast, to: 1, using: snapshot ? nil : Theme.Motion.basic(Theme.Motion.toastIn))
@@ -60,14 +72,15 @@ final class FooterBar: FlippedView {
     }
     func localize() {
         for (hint, key) in zip(hints, ["open", "reveal", "preview", "copy"]) { hint.localize(L10n.text("hint." + key)) }
-        syntax.localize(L10n.text("hint.syntax"))
+        syntax.localize(L10n.text("hint.syntax")); actions.localize(L10n.text("hint.actions"))
         if let (kind, value) = toastContent { toast.stringValue = Presentation.toastText(kind, value: value, chinese: L10n.chinese) }
+        else if let messageContent { toast.stringValue = L10n.text(messageContent.key, messageContent.value) }
         needsLayout = true
     }
     deinit { toastTimer?.invalidate() }
     override func layout() {
         super.layout()
-        let visibleHints = actionable && !warning ? hints + [syntax] : [syntax]
+        let visibleHints = actionable && !warning ? hints + [actions, syntax] : [actions, syntax]
         hints.forEach { $0.isHidden = !actionable || warning }
         var x = bounds.width - 18 - visibleHints.reduce(0) { $0 + $1.desiredWidth } - CGFloat(visibleHints.count - 1) * 10
         status.frame = NSRect(x: 22, y: 9, width: max(0, x - 38), height: 16)

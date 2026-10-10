@@ -176,7 +176,9 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
     var currentSource: ((String) -> SearchSource?)?
     var onOpen: (() -> Void)?
     var onSelection: (() -> Void)?
+    var onUserSelection: (() -> Void)?
     var onContextMenu: ((Int) -> NSMenu?)?
+    var onPasteboardWriter: ((Int) -> NSPasteboardWriting?)?
     var onDragging: ((Bool) -> Void)?
     var onRefreshApplied: ((SearchPresentation) -> Void)?
     var selectedRow: Int { table.selectedRow }
@@ -399,10 +401,11 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !refreshing else { return }
-        updateSelection(animated: !table.selectingWithPointer); recomputeHover(); onSelection?()
+        updateSelection(animated: !table.selectingWithPointer); recomputeHover(); onUserSelection?(); onSelection?()
     }
     @objc private func doubleClicked() { if table.clickedRow >= 0 { onOpen?() } }
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        if let onPasteboardWriter { return onPasteboardWriter(row) }
         guard let item = item(at: row), item.source.isOnline else { return nil }
         return NSURL(fileURLWithPath: item.path)
     }

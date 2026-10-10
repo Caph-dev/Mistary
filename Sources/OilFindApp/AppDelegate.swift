@@ -10,11 +10,11 @@ enum AppLog {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let appExtension: ApplicationExtension?
-    init(appExtension: ApplicationExtension? = nil) {
-        self.appExtension = appExtension
+    init(appExtension: ApplicationExtension? = nil, panel: SearchPanel = SearchPanel()) {
+        self.appExtension = appExtension; self.panel = panel
         super.init()
     }
-    private let panel = SearchPanel()
+    private let panel: SearchPanel
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var settingsItem: NSMenuItem?, extensionItem: NSMenuItem?
@@ -89,9 +89,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permissionTimer?.invalidate(); permissionTimer = nil
         welcomeController?.finish(); welcomeController = nil
         if let limited = request { startIndex(limited: limited) }
-        panel.show(source: source)
+        panel.show(source: source, captureContext: false)
     }
-    private func handleHotKey() {
+    func handleHotKey() {
         if welcomeState?.isShowing == true { finishWelcome(source: .hotkey) }
         else { panel.toggle(source: .hotkey) }
     }
@@ -103,7 +103,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.manager = manager; panel.searchController.manager = manager
         settingsController?.model.manager = manager
         panel.searchController.setState(.indexing)
-        panel.searchController.searchField.focus()
         indexStateStartedAt = ProcessInfo.processInfo.systemUptime
         manager.onStateChange = { [weak self, weak manager] state in
             guard let self, let manager else { return }
@@ -230,11 +229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func checkUpdates() { UpdateManager.shared.check() }
     @objc private func presentUpdate() { UpdateManager.shared.present() }
-    @objc private func showSearch() {
+    @objc func showSearch() {
         if welcomeState?.isShowing == true { welcomeController?.present() }
         else { panel.show(source: .menu) }
     }
-    @objc private func reopenRequested(_ notification: Notification) {
+    @objc func reopenRequested(_ notification: Notification) {
         AppLog.logger.info("reopen requested")
         if welcomeState?.isShowing == true { welcomeController?.present() }
         else { panel.show(source: .reopen) }

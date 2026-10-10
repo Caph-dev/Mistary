@@ -78,7 +78,9 @@ final class SearchPanel: NSPanel {
     private var fade: WindowFade?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
-    init(snapshot: Bool = false) {
+    private let contextResolver: ContextResolving
+    init(snapshot: Bool = false, contextResolver: ContextResolving = ContextResolver()) {
+        self.contextResolver = contextResolver
         searchController = SearchViewController(snapshot: snapshot)
         super.init(contentRect: NSRect(origin: .zero, size: Theme.panelSize), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         level = .floating; collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
@@ -94,8 +96,12 @@ final class SearchPanel: NSPanel {
     func toggle(source: PanelSource = .hotkey) {
         if isVisible && isKeyWindow && !hiding { hide(source: source) } else { show(source: source) }
     }
-    func show(source: PanelSource = .interaction) {
+    func show(source: PanelSource = .interaction, captureContext: Bool = true) {
         let cold = !isVisible
+        if cold || hiding || !searchController.session.isActive {
+            let context = captureContext && source.capturesExternalContext ? contextResolver.capture(source: source) : .ordinary
+            searchController.beginSession(source: source, context: context)
+        }
         if cold {
             let mouse = NSEvent.mouseLocation
             guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main else { return }
@@ -119,7 +125,8 @@ final class SearchPanel: NSPanel {
         fade = WindowFade(window: self, target: 1, duration: Theme.Motion.reduced ? Theme.Motion.reducedFade : Theme.Motion.panelInFade, curve: .easeOut)
         fade?.start()
     }
-    func hide(source: PanelSource = .interaction) {
+    func hide(source: PanelSource = .interaction, endingSession: Bool = true) {
+        if endingSession { searchController.endSession() }
         guard isVisible, !hiding else { return }
         AppLog.logger.info("panel hide source=\(source.rawValue, privacy: .public)")
         animationGeneration += 1; let token = animationGeneration

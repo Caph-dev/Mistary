@@ -18,6 +18,27 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     let results = ResultsView(frame: .zero)
     let footer = FooterBar(frame: .zero)
     let quickLook = QuickLook()
+    let session = SearchSession()
+    lazy var actionExecutor: ActionExecutor = {
+        var system = ActionSystem()
+        system.preview = { [weak self] url in
+            guard let self, self.validatedPreviewURL == url else { return false }
+            if self.quickLook.isVisible { self.quickLook.refresh() } else { self.quickLook.toggle() }
+            return true
+        }
+        let executor = ActionExecutor(session: session, system: system, sources: { [weak self] in
+            guard let self else { return [] }
+            return self.snapshot ? (self.results.result?.sources ?? []) : self.searchSources
+        })
+        executor.onEvent = { [weak self] event in
+            self?.actionDidFinish(event); self?.onActionEvent?(event)
+        }
+        return executor
+    }()
+    var onActionEvent: ((ActionEvent) -> Void)?
+    var animateOpen: ((@escaping () -> Void) -> Void)?
+    private var pendingOpen: ActionRequest?
+    private var previewRequest: ActionRequest?
     private let topLine = SeparatorView(), bottomLine = SeparatorView()
     private let empty = StateView(.empty), indexing = StateView(.indexing)
     let syntax = SyntaxReference(frame: .zero)
@@ -31,7 +52,6 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private var stateView: NSView?
     private var languageObserver: NSObjectProtocol?
     private var menuTracking = false, dragging = false
-    private var trashing: Set<URL> = []
     private var selectionAnchor: (sourceID: String, store: IndexStore, id: UInt32, path: String)?
     private var pendingNewSearch: Bool?
     var manager: IndexManager?
@@ -45,6 +65,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         return primary.map { [$0] + (additionalSources?() ?? []) } ?? (additionalSources?() ?? [])
     }
     func sourcesChanged() {
+        session.invalidateActions(); cancelPendingOpen()
+        quickLook.close(); previewRequest = nil
         supplementaryProvider?.sourcesDidChange(searchSources)
         _ = generation.next(); results.cancelPendingRefresh(); results.cancelPress()
         if supplementaryProvider?.isEnabled != true, let result = results.result, result.hasSupplements {
@@ -93,15 +115,20 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
         filters.onMenuTracking = { [weak self] tracking in
             self?.menuTracking = tracking
-            if !tracking { self?.hideIfInactive() }
+            if !tracking { self?.scheduleHideIfInactive() }
         }
         if !snapshot { results.currentSource = { [weak self] id in self?.searchSources.first { $0.id == id } } }
         results.onOpen = { [weak self] in self?.openSelected() }
         results.onSelection = { [weak self] in
-            self?.quickLook.refresh()
-            if let self, let item = self.results.selectedItem {
+            guard let self else { return }
+            self.refreshPreview()
+            if let item = self.results.selectedItem {
                 self.selectionAnchor = (item.source.id, item.source.store, item.id, item.path)
             }
+        }
+        results.onUserSelection = { [weak self] in
+            guard let self, self.quickLook.isVisible else { return }
+            self.performAction(.preview, togglingPreview: false)
         }
         results.onContextMenu = { [weak self] _ in self?.contextMenu() }
         results.onRefreshApplied = { [weak self] result in self?.resultDidChange(result) }
@@ -109,10 +136,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             self?.dragging = active
             if !active { self?.hideIfInactive() }
         }
-        quickLook.selectedURL = { [weak self] in
-            guard let self, self.results.selectedItem?.source.isOnline == true else { return nil }
-            return self.selectedURL
+        results.onPasteboardWriter = { [weak self] row in
+            guard let self, let item = self.results.item(at: row),
+                  let request = self.actionExecutor.capture(.copyFile, item: item),
+                  self.actionExecutor.validate(request) == nil else { return nil }
+            return request.target.url as NSURL
         }
+        quickLook.selectedURL = { [weak self] in self?.validatedPreviewURL }
         quickLook.onKey = { [weak self] event in self?.handleKey(event) ?? false }
         searchField.onSettings = { [weak self] in self?.onSettings?() }
         languageObserver = NotificationCenter.default.addObserver(forName: L10n.changed, object: nil, queue: .main) { [weak self] _ in self?.localize() }
@@ -130,6 +160,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private func localize() {
         filters.localize(); footer.localize(); empty.localize(); indexing.localize(); syntax.localize(); results.localize()
         searchField.localize()
+        footer.contextText = L10n.text("session." + session.context.mode.rawValue)
         if let result = results.result { updateFooter(result) }
         else if stateView === indexing { footer.text = L10n.text("footer.indexing", Presentation.countText(indexing.count)) }
         refreshProgress()
@@ -170,6 +201,19 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             }
         }
     }
+    func beginSession(source: PanelSource, context: SearchContext) {
+        session.begin(source: source, context: context); _ = generation.next()
+        cancelPendingOpen(); results.cancelPendingRefresh(); quickLook.close(); previewRequest = nil
+        footer.contextText = L10n.text("session." + context.mode.rawValue)
+    }
+    func endSession() {
+        session.end(); _ = generation.next(); cancelPendingOpen()
+        quickLook.close(); previewRequest = nil
+    }
+    private func cancelPendingOpen(reason: ActionFailure = .staleSession) {
+        results.cancelPress()
+        if let request = pendingOpen { pendingOpen = nil; actionExecutor.cancel(request, reason: reason) }
+    }
     func panelWillShow() {
         supplementaryProvider?.userActivity(visible: true, typing: false)
         let currentQuery = Query.parse(searchField.text, store: manager?.store)
@@ -179,6 +223,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         startSearch(preserveSelection: true)
     }
     func indexChanged() {
+        refreshPreview()
         supplementaryProvider?.sourcesDidChange(searchSources)
         if view.window?.isVisible == true { refreshSearch() }
     }
@@ -196,6 +241,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     func startSearch(preserveSelection: Bool = false) {
+        session.queryChanged(); cancelPendingOpen(); quickLook.close(); previewRequest = nil
         pendingNewSearch = preserveSelection
         results.cancelPendingRefresh()
         search(refresh: false, preserveSelection: preserveSelection)
@@ -212,7 +258,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     private func search(refresh: Bool, preserveSelection: Bool) {
         supplementaryProvider?.userActivity(visible: view.window?.isVisible == true, typing: !refresh && !preserveSelection)
-        let token = generation.next()
+        let token = generation.next(), sessionToken = session.token
         let sources = searchSources
         guard let store = sources.first?.store else { refreshProgress(); return }
         var options = filters.options
@@ -253,7 +299,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             let row = anchoredRow ?? 0
             let deferNames = anchor != nil && anchoredRow == nil && supplementary != nil && previous?.query.raw == query.raw
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation.current(token) else { return }
+                guard let self, self.generation.current(token), self.session.isCurrent(sessionToken) else { return }
                 self.diagnostics = query.diagnostics
                 if deferNames { return }
                 if refresh {
@@ -269,7 +315,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                     if box.hits.isEmpty && !deferNames { return }
                     let combined = box.hits.isEmpty ? found : found.supplement(box.hits, options: options)
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.generation.current(token), combined.isCurrent(self.searchSources) else { return }
+                        guard let self, self.generation.current(token), self.session.isCurrent(sessionToken), combined.isCurrent(self.searchSources) else { return }
                         self.pendingNewSearch = nil
                         self.results.refresh(combined)
                     }
@@ -353,10 +399,6 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             footer.text = L10n.text("footer.results", Presentation.countText(0), Presentation.elapsedText(found.elapsedMs))
         }
     }
-    private var selectedURL: URL? {
-        guard stateView == nil else { return nil }
-        return results.selectedItem.map { URL(fileURLWithPath: $0.path) }
-    }
     func handleKey(_ event: NSEvent) -> Bool {
         if (view.window as? SearchPanel)?.hiding == true { return true }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -390,6 +432,9 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
         guard command else { return false }
         switch key {
+        case "k" where flags == .command:
+            let menu = contextMenu()
+            menu.popUp(positioning: nil, at: NSPoint(x: 22, y: 0), in: footer); return true
         case "y": previewSelected(); return true
         case "c":
             if option { copyName(); return true }
@@ -401,78 +446,111 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         default: return false
         }
     }
-    private func openSelected() {
-        guard stateView == nil, (view.window as? SearchPanel)?.hiding != true, let url = selectedURL else { return }
-        guard allowOnlineAction() else { return }
-        guard FileManager.default.fileExists(atPath: url.path) else { NSSound.beep(); return }
-        results.pressOpen { [weak self] in
-            guard self?.allowOnlineAction() == true else { return }
-            guard NSWorkspace.shared.open(url) else { NSSound.beep(); return }
-            self?.hidePanel?()
+    func requestAction(_ action: FileAction) -> ActionRequest? {
+        guard stateView == nil, let item = results.selectedItem else { return nil }
+        return actionExecutor.capture(action, item: item)
+    }
+    private var validatedPreviewURL: URL? {
+        guard let request = previewRequest, actionExecutor.validate(request) == nil else { return nil }
+        return request.target.url
+    }
+    private func refreshPreview() {
+        guard quickLook.isVisible else { return }
+        if validatedPreviewURL == nil { quickLook.close(); previewRequest = nil }
+        else { quickLook.refresh() }
+    }
+    private func openSelected() { performAction(.open) }
+    private func revealSelected() { performAction(.reveal) }
+    private func previewSelected() { performAction(.preview) }
+    private func copyPath() { performAction(.copyPath) }
+    private func copyName() { performAction(.copyName) }
+    private func trashSelected() { performAction(.trash) }
+    func performAction(_ action: FileAction, request captured: ActionRequest? = nil, togglingPreview: Bool = true) {
+        guard (view.window as? SearchPanel)?.hiding != true else { return }
+        if action == .preview && togglingPreview && quickLook.isVisible {
+            quickLook.close(); previewRequest = nil; return
         }
-    }
-    private func revealSelected() { guard stateView == nil, let url = selectedURL, allowOnlineAction() else { return }; NSWorkspace.shared.activateFileViewerSelecting([url]); hidePanel?() }
-    @discardableResult
-    private func allowOnlineAction() -> Bool {
-        guard let item = results.selectedItem else { return false }
-        // Check the live provider as well as the submitted snapshot during an in-flight refresh.
-        let current = searchSources.first { $0.id == item.source.id }
-        guard item.source.isOnline && (snapshot || current?.isOnline == true) else {
-            footer.warning = true; footer.actionable = false
-            footer.text = L10n.text("source.unavailable", item.source.displayName)
-            return false
-        }
-        return snapshot || current?.store === item.source.store
-    }
-    private func previewSelected() { if allowOnlineAction() { quickLook.toggle() } }
-    private func copyPath() {
-        guard stateView == nil, let url = selectedURL else { return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([url as NSURL]); NSPasteboard.general.setString(url.path, forType: .string)
-        footer.showToast(.copiedPath, value: url.path)
-    }
-    private func copyName() {
-        guard stateView == nil, let item = results.selectedItem else { return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(item.name, forType: .string)
-        footer.showToast(.copiedName, value: item.name)
-    }
-    private func trashSelected() {
-        guard stateView == nil, let url = selectedURL, let item = results.selectedItem else { return }
-        guard allowOnlineAction(), FileManager.default.fileExists(atPath: url.path), trashing.insert(url).inserted else { return }
-        NSWorkspace.shared.recycle([url]) { [weak self] _, error in
-            DispatchQueue.main.async {
-                self?.trashing.remove(url)
-                if error != nil { NSSound.beep() }
-                else { self?.footer.showToast(.trashed, value: item.name) }
+        guard let request = captured ?? requestAction(action) else { return }
+        if action == .open {
+            cancelPendingOpen(reason: .superseded)
+            if actionExecutor.validate(request) != nil { actionExecutor.execute(request); return }
+            pendingOpen = request
+            let completion = { [weak self] in
+                guard let self, self.pendingOpen?.actionID == request.actionID else { return }
+                self.pendingOpen = nil; self.actionExecutor.execute(request)
             }
+            if let animateOpen { animateOpen(completion) } else { results.pressOpen(completion) }
+        } else {
+            if action == .preview { previewRequest = request }
+            actionExecutor.execute(request)
         }
     }
-    private func contextMenu() -> NSMenu {
-        let menu = NSMenu(); menu.delegate = self
-        for (i, key) in ["open", "reveal", "preview", "-", "copyPath", "copyName", "-", "trash"].enumerated() {
-            if key == "-" { menu.addItem(.separator()); continue }
-            let item = NSMenuItem(title: L10n.text("ctx." + key), action: #selector(contextAction(_:)), keyEquivalent: "")
-            item.target = self; item.tag = i
-            if i == 7 { item.isEnabled = results.selectedItem?.source.isOnline == true }
+    private func actionDidFinish(_ event: ActionEvent) {
+        // Completion events still reach other consumers after a focus handoff.
+        guard session.isCurrent(event.request.token) else { return }
+        let request = event.request
+        switch event.outcome {
+        case .accepted:
+            if request.action == .open || request.action == .reveal { hidePanel?() }
+        case .verified:
+            switch request.action {
+            case .copyPath: footer.showToast(.copiedPath, value: request.target.url.path)
+            case .copyName: footer.showToast(.copiedName, value: request.target.name)
+            case .copyFile: footer.showMessage("action.copiedFile", value: request.target.name, snapshot: snapshot)
+            case .trash: footer.showToast(.trashed, value: request.target.name)
+            default: break
+            }
+        case .cancelled(let failure), .failed(let failure):
+            if failure == .sourceUnavailable {
+                footer.warning = true; footer.actionable = false
+                footer.text = L10n.text("source.unavailable", request.target.sourceName)
+            }
+            footer.showMessage("action." + failure.rawValue, snapshot: snapshot)
+            if request.action == .preview { quickLook.close(); previewRequest = nil }
+        }
+    }
+    func contextMenu() -> NSMenu {
+        let menu = NSMenu(); menu.autoenablesItems = false; menu.delegate = self
+        let actions: [FileAction?] = [.open, .reveal, .preview, nil, .copyFile, .copyPath, .copyName, nil, .trash, nil, .contextNavigation]
+        for action in actions {
+            guard let action else { menu.addItem(.separator()); continue }
+            let item = NSMenuItem(title: L10n.text("ctx." + action.rawValue), action: #selector(contextAction(_:)), keyEquivalent: "")
+            item.target = self
+            let request = requestAction(action)
+            item.representedObject = request
+            item.isEnabled = request.map { actionExecutor.validate($0) == nil } ?? false
             menu.addItem(item)
         }
         return menu
     }
-    @objc private func contextAction(_ item: NSMenuItem) {
-        switch item.tag { case 0: openSelected(); case 1: revealSelected(); case 2: previewSelected(); case 4: copyPath(); case 5: copyName(); case 7: trashSelected(); default: break }
+    @objc func contextAction(_ item: NSMenuItem) {
+        guard let request = item.representedObject as? ActionRequest else { return }
+        performAction(request.action, request: request)
     }
     func menuWillOpen(_ menu: NSMenu) { menuTracking = true }
-    func menuDidClose(_ menu: NSMenu) { menuTracking = false; hideIfInactive() }
+    func menuDidClose(_ menu: NSMenu) {
+        menuTracking = false
+        // AppKit dispatches the chosen action after menu tracking closes.
+        scheduleHideIfInactive()
+    }
+    private func scheduleHideIfInactive() {
+        let sessionID = session.sessionID
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.session.sessionID == sessionID else { return }
+            self.hideIfInactive()
+        }
+    }
     private func hideIfInactive() {
-        if view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging { hidePanel?() }
+        if session.isActive && pendingOpen == nil && view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging { hidePanel?() }
     }
     func windowDidResignKey(_ notification: Notification) {
         // Quick Look visibility settles after the key-window transition.
-        DispatchQueue.main.async { [weak self] in self?.hideIfInactive() }
+        scheduleHideIfInactive()
     }
     func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? {
         (client as? NSTextField) === searchField.input ? searchField.editor : nil
     }
-    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { selectedURL != nil }
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { validatedPreviewURL != nil }
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) { quickLook.begin(panel) }
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) { quickLook.end(panel) }
 }
