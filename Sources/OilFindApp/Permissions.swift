@@ -1,7 +1,26 @@
 import AppKit
 import Darwin
+import ApplicationServices
+
+struct SystemAccessibilityPermission: AccessibilityPermissionChecking {
+    func isTrusted() -> Bool { AXIsProcessTrusted() }
+    @discardableResult func requestTrust() -> Bool {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
+}
+
+/// Automation is target-specific and is not implied by AX or Full Disk Access.
+struct PermissionStatus {
+    let fullDiskAccess: Bool
+    let accessibility: Bool
+    let automation: String = "notRequested"
+}
 
 enum Permissions {
+    static func status(accessibility: AccessibilityPermissionChecking = SystemAccessibilityPermission()) -> PermissionStatus {
+        PermissionStatus(fullDiskAccess: hasFullDiskAccess(), accessibility: accessibility.isTrusted())
+    }
     static func hasFullDiskAccess() -> Bool {
         let path = NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db"
         let descriptor = Darwin.open(path, O_RDONLY)
