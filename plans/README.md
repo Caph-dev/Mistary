@@ -10,7 +10,7 @@
 
 1. [001：身份、持久化与更新隔离](001-product-isolation.md) — **已完成（按操作者决定，真实环境验收暂缓）**。P1 / M / 高风险。依赖：无。阶段 M0。实现提交：`2f5f32d2089ad9c902659a460b8310ca21bc97d3`。交付：`build/debug/Mistary.app`（ad-hoc）。证据：[001-isolation.md](evidence/001-isolation.md)。双应用共存、真实偏好域、登录项和稳定签名权限保持尚未验证。
 2. [002：AX 可行性与兼容清单](002-ax-feasibility.md) — **已完成（按操作者决定，真机验收暂缓）**。P1 / M / 高风险。依赖：001。阶段 AX 实验。实现提交：`befa001c10413e677555058314ec7f6c642acdf7`。Debug 回归 27 项、Release 筛选 25 项通过，调试包与 Release 边界已验证。结论：未判定；当前进程 AX 未授权，005 自动导航支持集合为空。证据：[002-ax-compatibility.md](evidence/002-ax-compatibility.md)。
-3. [003：搜索会话与动作执行器](003-search-session-actions.md) — **已完成（按操作者决定，跨应用真机验收暂缓）**。P1 / M / 中风险。依赖：001。阶段 M1 基础。实现提交：本次实施提交（完整 SHA 在提交后的记录补充）。计划指定测试 33 项及补充回归 22 项通过，Release 与调试包构建、签名和中英文界面快照已验证。所有目标窗口导航仍 unavailable。证据：[003-search-session-actions.md](evidence/003-search-session-actions.md)。
+3. [003：搜索会话与动作执行器](003-search-session-actions.md) — **已完成（按操作者决定，跨应用真机验收暂缓）**。P1 / M / 中风险。依赖：001。阶段 M1 基础。实现提交：`35ccb53a668bdcdac9abf46b3fb1090db67ca513`。计划指定测试 33 项及补充回归 22 项通过，Release 与调试包构建、签名和中英文界面快照已验证。所有目标窗口导航仍 unavailable。证据：[003-search-session-actions.md](evidence/003-search-session-actions.md)。
 4. [004：Finder、精确目录范围与收藏](004-finder-scope-favorites.md) — **待执行**。P1 / L / 中风险。依赖：003。阶段 M1。证据：未生成。
 5. [005：打开／保存对话框工作流](005-dialog-workflows.md) — **待执行**。P1 / L / 高风险。依赖：002、003、004。阶段 M1。路线：待 AX 结论。证据：未生成。
 6. [006：应用别名、网页关键字与结果类型](006-launcher-query-routing.md) — **待执行**。P2 / M / 中风险。硬依赖：003；收藏与对话框为可后接的集成。阶段 M2。证据：未生成。
