@@ -50,7 +50,7 @@ final class LanguageTests: XCTestCase {
         settle(window)
         XCTAssertEqual(model.language, .english)
         XCTAssertEqual(AppLanguage.load(from: store), .english)
-        XCTAssertEqual(window.title, "Oil Find Settings")
+        XCTAssertEqual(window.title, "Mistary Settings")
         XCTAssertTrue(picker.itemTitles.contains("Follow System"))
         model.setLanguage(.system)
         XCTAssertEqual(AppLanguage.load(from: store), .system)
@@ -106,16 +106,20 @@ final class LanguageTests: XCTestCase {
         L10n.setLanguage(.chinese, in: store)
         let search = SearchViewController(snapshot: true)
         _ = search.view
+        #if DEBUG
         let update = UpdateManager(snapshot: true)
         update.prepareSnapshot(.latest, manifest: nil)
         let controller = UpdateWindowController(model: update)
         defer { controller.window?.close() }
+        #endif
         L10n.setLanguage(.english, in: store)
         XCTAssertTrue(search.searchField.input.isEnabled)
         XCTAssertEqual(search.searchField.input.placeholderAttributedString?.string, "Search files, folders and apps")
         XCTAssertFalse(descendants(search.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue.localizedCaseInsensitiveContains("license") })
+        #if DEBUG
         XCTAssertEqual(controller.window?.title, "Check for Updates…")
         XCTAssertEqual(update.state, .latest)
+        #endif
     }
 
     func testLegacyAuthorizationCleanupRemovesOldLocalRecords() throws {

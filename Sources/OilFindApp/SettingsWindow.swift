@@ -204,15 +204,7 @@ private struct UpdateSettingsRow: View {
     @ObservedObject var update: UpdateManager
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Toggle(L10n.text("update.auto"), isOn: $update.automatic)
-                    Text(L10n.text("update.autoHint")).font(.footnote).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
-                Button(L10n.text("update.check")) { update.check() }.disabled(!update.canCheck)
-            }
+            Text(L10n.text("update.disabled")).font(.footnote).foregroundStyle(.secondary)
             Text(UpdateManager.current.version.text).font(.footnote).foregroundStyle(.secondary)
         }
     }

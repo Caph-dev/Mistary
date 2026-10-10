@@ -4,7 +4,7 @@ import OilFindCore
 // Keys and copy are shared by every surface, including snapshots.
 enum L10n {
     static var snapshotChinese: Bool?
-    static let changed = Notification.Name("com.oiloil.find.languageChanged")
+    static let changed = Notification.Name(ProductIdentity.bundleIdentifier + ".languageChanged")
     private(set) static var language = AppLanguage.load()
     static var chinese: Bool { snapshotChinese ?? language.usesChinese() }
     static func setLanguage(_ value: AppLanguage, in defaults: UserDefaults = .standard) {
@@ -38,16 +38,18 @@ enum L10n {
         }
     }
     private static let strings: [String: (String, String)] = [
+        "product.name": (ProductIdentity.displayName, ProductIdentity.displayName),
+        "update.disabled": ("此个人版本不提供应用内更新。", "This personal build does not provide in-app updates."),
         "source.offline": ("未连接", "Not connected"),
         "source.unavailable": ("「%@」未连接，连接后才能打开。", "“%@” is not connected. Connect it to open this file."),
         "update.check": ("检查更新…", "Check for Updates…"),
-        "update.available.title": ("Oil Find %@ 可以更新了", "Oil Find %@ Is Available"),
+        "update.available.title": ("\(ProductIdentity.displayName) %@ 可以更新了", "\(ProductIdentity.displayName) %@ Is Available"),
         "update.available.current": ("你现在用的是 %@。", "You have %@."),
         "update.install": ("更新并重启", "Update and Restart"),
         "update.later": ("稍后", "Later"),
         "update.skip": ("跳过这个版本", "Skip This Version"),
         "update.latest.title": ("已是最新版本", "You're Up to Date"),
-        "update.latest.body": ("Oil Find %@ 是最新版本。", "Oil Find %@ is the latest version."),
+        "update.latest.body": ("\(ProductIdentity.displayName) %@ 是最新版本。", "\(ProductIdentity.displayName) %@ is the latest version."),
         "update.downloading": ("正在下载更新… %@", "Downloading Update… %@"),
         "update.installing": ("正在安装…", "Installing…"),
         "update.failed": ("更新没有完成：%@。可以到官网下载新版本。", "The update didn't finish: %@. You can download the new version from the website."),
@@ -57,8 +59,8 @@ enum L10n {
         "update.autoHint": ("每天检查一次，只读取版本信息。", "Checks once a day and only reads version info."),
         "update.reason.network": ("网络连接失败", "the network connection failed"),
         "update.reason.integrity": ("下载的文件校验没有通过", "the downloaded file didn't pass verification"),
-        "update.reason.signature": ("新版本的签名不是 Oil Find 的", "the new version isn't signed by Oil Find"),
-        "update.reason.permission": ("没有权限替换当前的应用", "Oil Find can't replace the current app"),
+        "update.reason.signature": ("新版本的签名不是 \(ProductIdentity.displayName) 的", "the new version isn't signed by \(ProductIdentity.displayName)"),
+        "update.reason.permission": ("没有权限替换当前的应用", "\(ProductIdentity.displayName) can't replace the current app"),
         "update.reason.other": ("发生了意外错误", "something unexpected happened"),
         "coverage.title": ("未覆盖", "Not Covered"),
         "coverage.noAccess": ("没有权限的文件夹：%@ 个", "Folders without access: %@"),
@@ -70,7 +72,7 @@ enum L10n {
         "explain.indexed": ("已在索引中，可以搜到。", "It's in the index and can be found."),
         "explain.scope": ("被「%@」范围排除。在上面打开这个开关后就能搜到。", "Excluded by the \"%@\" scope. Turn it on above to include it."),
         "explain.userExcluded": ("在你排除的路径「%@」里。", "It's inside a path you excluded: %@."),
-        "explain.noAccess": ("Oil Find 没有权限读取它所在的文件夹。授予完全磁盘访问权限后会自动补上。", "Oil Find can't read the folder it's in. It'll be added once you grant Full Disk Access."),
+        "explain.noAccess": ("\(ProductIdentity.displayName) 没有权限读取它所在的文件夹。授予完全磁盘访问权限后会自动补上。", "\(ProductIdentity.displayName) can't read the folder it's in. It'll be added once you grant Full Disk Access."),
         "explain.volume": ("它在外置磁盘或网络卷上，不在索引范围内。", "It's on an external or network volume, which isn't indexed."),
         "explain.cloud": ("它在仅存于云端的文件夹里，下载到这台 Mac 后才能搜到。", "It's in a folder that's only in the cloud. Download it to this Mac to search it."),
         "explain.pending": ("还没有进入索引，稍后会自动加入。", "It isn't indexed yet. It'll be added shortly."),
@@ -104,7 +106,7 @@ enum L10n {
         "welcome.changeHotkey": ("更改快捷键…", "Change Shortcut…"),
         "welcome.permission": ("完全磁盘访问权限", "Full Disk Access"),
         "welcome.permission.caption": ("不授权也能用，只是搜不到邮件和其他应用的数据。", "Optional. Without it, Mail and other apps' data can't be searched."),
-        "welcome.permission.waiting": ("在列表里打开 Oil Find 的开关，系统会提示重新打开应用。", "Turn on Oil Find in the list. macOS will ask to reopen the app."),
+        "welcome.permission.waiting": ("在列表里打开 \(ProductIdentity.displayName) 的开关，系统会提示重新打开应用。", "Turn on \(ProductIdentity.displayName) in the list. macOS will ask to reopen the app."),
         "welcome.permission.open": ("打开系统设置", "Open System Settings"),
         "welcome.permission.granted": ("已授权", "Granted"),
         "welcome.start": ("开始使用", "Get Started"),
@@ -120,11 +122,11 @@ enum L10n {
         "menu.limited": ("未获得完全磁盘访问权限…", "Full Disk Access not granted…"),
         "menu.hotkeyFailed": ("快捷键已被其他应用占用", "Shortcut is in use by another app"),
         "menu.loginItem": ("登录时启动", "Launch at Login"), "menu.settings": ("设置…", "Settings…"),
-        "menu.quit": ("退出 Oil Find", "Quit Oil Find"),
+        "menu.quit": ("退出 \(ProductIdentity.displayName)", "Quit \(ProductIdentity.displayName)"),
         "ctx.open": ("打开", "Open"), "ctx.reveal": ("在访达中显示", "Show in Finder"),
         "ctx.preview": ("快速查看", "Quick Look"), "ctx.copyPath": ("拷贝路径", "Copy Path"),
         "ctx.copyName": ("拷贝名称", "Copy Name"), "ctx.trash": ("移到废纸篓", "Move to Trash"),
-        "settings.title": ("Oil Find 设置", "Oil Find Settings"),
+        "settings.title": ("\(ProductIdentity.displayName) 设置", "\(ProductIdentity.displayName) Settings"),
         "settings.general": ("通用", "General"),
         "settings.language": ("语言", "Language"),
         "settings.language.system": ("跟随系统", "Follow System"),
@@ -146,7 +148,7 @@ enum L10n {
         "settings.rebuild": ("重建索引", "Rebuild Index"),
         "settings.rebuilding": ("正在重建…", "Rebuilding…"),
         "settings.scope": ("索引范围", "Index Scope"),
-        "settings.scopeHint": ("默认只索引你自己的文件。下面几类数量庞大、很少按名称查找，需要时再打开。改动之后会自动重建索引。", "Oil Find indexes your own files by default. The categories below are large and rarely searched by name; turn them on when you need them. The index rebuilds after changes."),
+        "settings.scopeHint": ("默认只索引你自己的文件。下面几类数量庞大、很少按名称查找，需要时再打开。改动之后会自动重建索引。", "\(ProductIdentity.displayName) indexes your own files by default. The categories below are large and rarely searched by name; turn them on when you need them. The index rebuilds after changes."),
         "settings.scope.dependency": ("开发依赖目录", "Dependency Folders"),
         "settings.scope.dependencyHint": ("node_modules、site-packages、.venv、Pods、DerivedData、.git 等", "node_modules, site-packages, .venv, Pods, DerivedData, .git and similar"),
         "settings.scope.packages": ("应用与包的内部文件", "Inside Apps and Packages"),

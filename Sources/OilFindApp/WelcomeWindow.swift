@@ -45,7 +45,7 @@ struct WelcomeContent: View {
     var body: some View {
         VStack(spacing: 0) {
             Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 72, height: 72)
-            Text("Oil Find").font(.system(size: 22, weight: .semibold)).padding(.top, 14)
+            Text(L10n.text("product.name")).font(.system(size: 22, weight: .semibold)).padding(.top, 14)
             Text(L10n.text("welcome.subtitle")).font(.system(size: 13))
                 .foregroundStyle(Color(nsColor: .secondaryLabelColor)).padding(.top, 6)
             HStack(spacing: 8) {

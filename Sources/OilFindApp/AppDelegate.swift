@@ -5,7 +5,7 @@ import os
 import OilFindCore
 
 enum AppLog {
-    static let logger = Logger(subsystem: "com.oiloil.find", category: "app")
+    static let logger = Logger(subsystem: ProductIdentity.bundleIdentifier, category: "app")
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -32,10 +32,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var indexStateStartedAt = ProcessInfo.processInfo.systemUptime
     private var limited = false
     private var countItem: NSMenuItem?, limitedItem: NSMenuItem?, loginItem: NSMenuItem?, rescanItem: NSMenuItem?
-    static let dbURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Oil Find/index.oilfind")
-    private static let showRequest = Notification.Name("com.oiloil.find.show")
+    static let dbURL = ProductIdentity.indexURL()
+    private static let showRequest = ProductIdentity.showRequest
     func applicationDidFinishLaunching(_ notification: Notification) {
-        LegacyAuthorizationCleanup.run()
         DispatchQueue.global(qos: .utility).async { _ = Pinyin.shared }
         if let id = Bundle.main.bundleIdentifier, NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
             secondaryInstance = true
@@ -43,8 +42,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { NSApp.terminate(nil) }
             return
         }
-        UpdateManager.shared.start()
-        UpdateManager.shared.onChange = { [weak self] in self?.refreshUpdateMenu() }
         NSApp.setActivationPolicy(.accessory)
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(reopenRequested(_:)), name: Self.showRequest, object: nil)
         let defaults = UserDefaults.standard
@@ -80,9 +77,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if let limited = indexRequest { startIndex(limited: limited) }
-        if let failure = SystemUpdateFiles().cleanupAfterLaunch(application: Bundle.main.bundleURL, current: UpdateManager.current) {
-            UpdateManager.shared.reportLaunchFailure(failure)
-        }
     }
     private func finishWelcome(source: PanelSource = .welcome) {
         guard welcomeState?.isShowing == true else { return }
@@ -152,8 +146,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem = item("menu.loginItem", #selector(toggleLogin))
         settingsItem = item("menu.settings", #selector(showSettings), ",")
         refreshExtensionMenu()
-        checkUpdateItem = item("update.check", #selector(checkUpdates))
-        updateItem = item("update.check", #selector(presentUpdate))
+        if UpdateManager.shared.isEnabled {
+            checkUpdateItem = item("update.check", #selector(checkUpdates))
+            updateItem = item("update.check", #selector(presentUpdate))
+        }
         refreshUpdateMenu()
         menu.addItem(.separator()); quitItem = item("menu.quit", #selector(quit), "q")
         appExtension?.onSettingsMenuItemChange = { [weak self] in self?.refreshExtensionMenu() }
@@ -260,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UpdateManager.shared.preventsTermination ? .terminateCancel : .terminateNow
     }
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls { appExtension?.handle(url) }
+        for url in urls where url.scheme?.lowercased() == ProductIdentity.urlScheme { appExtension?.handle(url) }
     }
     func applicationWillTerminate(_ notification: Notification) { if !secondaryInstance { appExtension?.stop(); UpdateManager.shared.stop() }; settingsController?.model.stopRefreshing(); permissionTimer?.invalidate(); hotKey?.unregister(); manager?.stop() }
     deinit { if let languageObserver { NotificationCenter.default.removeObserver(languageObserver) } }

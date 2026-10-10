@@ -1,13 +1,13 @@
 #!/bin/bash
-# Creates the stable self-signed code-signing identity used for Oil Find releases.
-# A stable identity lets macOS keep Full Disk Access across updates (ad-hoc builds
-# get a new identity every time). Run once on the release Mac; keep the backup safe.
+# Creates the stable self-signed code-signing identity used for Mistary releases.
+# A stable identity supports permission persistence; verify it on the target Mac.
+# Ad-hoc rebuilds do not guarantee persistence. Run once manually; keep the backup safe.
 set -euo pipefail
 
-NAME="Oil Find Self-Signed"
+NAME="Mistary Self-Signed"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
-BACKUP_DIR="$HOME/Documents/Oil Find Signing"
-P12="${BACKUP_DIR}/oil-find-signing.p12"
+BACKUP_DIR="$HOME/Documents/Mistary Signing"
+P12="${BACKUP_DIR}/mistary-signing.p12"
 OPENSSL=/usr/bin/openssl
 
 already_done() {
