@@ -10,6 +10,8 @@ final class SettingsModel: ObservableObject {
     let update: UpdateManager
     let favorites: FavoritesStore
     let launcher: LauncherPreferences
+    let customActions: ActionDefinitions
+    let savedFilters: SavedFiltersStore
     private var languageObserver: NSObjectProtocol?
     private let languageDefaults: UserDefaults
     private var coverageExplanation: CoverageExplanation?
@@ -50,6 +52,8 @@ final class SettingsModel: ObservableObject {
         self.snapshot = snapshot
         self.favorites = snapshot ? FavoritesStore(url: nil) : .shared
         self.launcher = snapshot ? LauncherPreferences(url: nil) : .shared
+        self.customActions = snapshot ? ActionDefinitions(url: nil) : .shared
+        self.savedFilters = snapshot ? SavedFiltersStore(url: nil) : .shared
         self.languageDefaults = languageDefaults
         self.language = L10n.language
         self.update = snapshot ? UpdateManager(snapshot: true) : .shared
@@ -362,6 +366,91 @@ private struct LauncherKeywordRow: View {
     }
 }
 
+private struct CustomActionsSettingsSection: View {
+    @ObservedObject var store: ActionDefinitions
+    @State private var draft = ""
+    @State private var failed = false
+    var body: some View {
+        Section(L10n.text("custom.settings")) {
+            Text(L10n.text("custom.hint")).font(.footnote).foregroundStyle(.secondary)
+            TextEditor(text: $draft).font(.system(size: 11, design: .monospaced)).frame(height: 150)
+            HStack {
+                Button(L10n.text("launcher.save")) {
+                    do {
+                        let definitions = try JSONDecoder().decode([ActionDefinition].self, from: Data(draft.utf8))
+                        try store.set(definitions); failed = false
+                    } catch { failed = true }
+                }
+                Button(L10n.text("custom.example")) {
+                    let example = ActionDefinition(id: UUID(), name: L10n.text("custom.exampleName"), itemTypes: [.file],
+                        modes: SearchMode.allActionModes, permissions: [.processExecution, .fileRead], enabled: true,
+                        execution: .command(executable: URL(fileURLWithPath: "/usr/bin/open"), arguments: ["{path}"], currentDirectory: nil))
+                    load(store.actions + [example])
+                }
+            }
+            if failed || store.error != nil { Text(L10n.text("custom.configError")).foregroundStyle(.red) }
+        }.onAppear { load(store.actions) }
+    }
+    private func load(_ definitions: [ActionDefinition]) {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        draft = (try? encoder.encode(definitions)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+    }
+}
+
+private struct SavedFiltersSettingsSection: View {
+    @ObservedObject var store: SavedFiltersStore
+    @State private var failed = false
+    var body: some View {
+        Section(L10n.text("saved.settings")) {
+            Text(L10n.text("saved.hint")).font(.footnote).foregroundStyle(.secondary)
+            ForEach(store.filters) { filter in SavedFilterSettingsRow(store: store, original: filter, failed: $failed) }
+            if failed || store.error != nil { Text(L10n.text("saved.error")).foregroundStyle(.red) }
+        }
+    }
+}
+private struct SavedFilterSettingsRow: View {
+    @ObservedObject var store: SavedFiltersStore
+    let original: SavedFilter
+    @Binding var failed: Bool
+    @State private var draft: SavedFilter?
+    var body: some View {
+        if let draft {
+            VStack(alignment: .leading, spacing: 5) {
+                TextField(L10n.text("saved.name"), text: binding(\.name))
+                TextField(L10n.text("saved.query"), text: binding(\.query))
+                HStack {
+                    Picker(L10n.text("saved.sort"), selection: binding(\.sort)) {
+                        ForEach(["relevance", "name", "modified", "size"], id: \.self) { Text(L10n.text("sort." + $0)).tag($0) }
+                    }
+                    Toggle(L10n.text("saved.ascending"), isOn: binding(\.ascending))
+                }
+                HStack {
+                    Picker(L10n.text("saved.kind"), selection: Binding(get: { Int(draft.kind ?? 0) }, set: { self.draft?.kind = $0 == 0 ? nil : UInt8($0) })) {
+                        ForEach(0..<FilterBar.names.count, id: \.self) { Text(L10n.text("filter." + FilterBar.names[$0])).tag($0) }
+                    }
+                    Toggle(L10n.text("settings.pinyin"), isOn: binding(\.pinyin))
+                }
+                TextField(L10n.text("saved.scope"), text: Binding(get: { draft.scope ?? "" }, set: { self.draft?.scope = $0.isEmpty ? nil : $0 }))
+                HStack {
+                    Button(L10n.text("launcher.save")) {
+                        var updated = store.filters
+                        if let index = updated.firstIndex(where: { $0.id == original.id }) { updated[index] = draft }
+                        persist(updated)
+                    }
+                    Button(L10n.text("launcher.remove")) { persist(store.filters.filter { $0.id != original.id }) }
+                }
+            }
+            .onChange(of: original) { _, value in self.draft = value }
+        } else { Text(original.name).onAppear { draft = original } }
+    }
+    private func binding<T>(_ key: WritableKeyPath<SavedFilter, T>) -> Binding<T> {
+        Binding(get: { (draft ?? original)[keyPath: key] }, set: { draft?[keyPath: key] = $0 })
+    }
+    private func persist(_ updated: [SavedFilter]) {
+        do { try store.set(updated); failed = false } catch { failed = true }
+    }
+}
+
 private struct UpdateSettingsRow: View {
     @ObservedObject var update: UpdateManager
     var body: some View {
@@ -488,6 +577,8 @@ private struct SettingsForm: View {
               footer: { hint(L10n.text("settings.scopeHint")) }
             FavoriteSettingsSection(store: model.favorites, window: window)
             LauncherSettingsSection(store: model.launcher, window: window)
+            CustomActionsSettingsSection(store: model.customActions)
+            SavedFiltersSettingsSection(store: model.savedFilters)
             if let appExtension { appExtension.settingsSection(window: window) }
             Section {
                 if model.excludedPaths.isEmpty { Text(L10n.text("settings.noExcluded")).foregroundStyle(.secondary) }

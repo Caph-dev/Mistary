@@ -22,6 +22,9 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     let session = SearchSession()
     let favorites: FavoritesStore
     let launcher: LauncherPreferences
+    let customActions: ActionDefinitions
+    let savedFilters: SavedFiltersStore
+    private var activatedPinyin: Bool?
     private var launcherObserver: AnyCancellable?
     private let modeButton = NSButton(title: "", target: nil, action: nil)
     private let fileSearchButton = NSButton(title: "", target: nil, action: nil)
@@ -59,6 +62,14 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         executor.onEvent = { [weak self] event in
             self?.actionDidFinish(event); self?.onActionEvent?(event)
         }
+        executor.onCustomEvent = { [weak self] event in
+            guard let self, self.session.isCurrent(event.request.token) else { return }
+            switch event.outcome {
+            case .accepted: self.footer.showMessage("custom.accepted", snapshot: self.snapshot)
+            case .verified: self.footer.showMessage("custom.finished", snapshot: self.snapshot)
+            case .failed(let failure), .cancelled(let failure): self.footer.showMessage("action." + failure.rawValue, snapshot: self.snapshot)
+            }
+        }
         executor.onPaletteEvent = { [weak self] event in
             self?.paletteActionDidFinish(event); self?.onPaletteActionEvent?(event)
         }
@@ -82,6 +93,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private var stateView: NSView?
     private var languageObserver: NSObjectProtocol?
     private var menuTracking = false, dragging = false
+    private var actionModalActive = false
     private var selectionAnchor: (sourceID: String, store: IndexStore, id: UInt32, path: String)?
     private var paletteSelectionAnchor: String?
     private var snapshotSources: [SearchSource] = []
@@ -123,10 +135,12 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     var hidePanel: (() -> Void)?
     var onSettings: (() -> Void)?
-    init(snapshot: Bool, favorites: FavoritesStore? = nil, launcher: LauncherPreferences? = nil, searchQueue: DispatchQueue? = nil) {
+    init(snapshot: Bool, favorites: FavoritesStore? = nil, launcher: LauncherPreferences? = nil, customActions: ActionDefinitions? = nil, savedFilters: SavedFiltersStore? = nil, searchQueue: DispatchQueue? = nil) {
         self.snapshot = snapshot
         self.queue = searchQueue ?? DispatchQueue(label: "com.oiloil.find.search", qos: .userInteractive)
         self.launcher = launcher ?? (snapshot ? LauncherPreferences(url: nil) : .shared)
+        self.customActions = customActions ?? (snapshot ? ActionDefinitions(url: nil) : .shared)
+        self.savedFilters = savedFilters ?? (snapshot ? SavedFiltersStore(url: nil) : .shared)
         self.favorites = favorites ?? (snapshot ? FavoritesStore(url: nil) : .shared)
         super.init(nibName: nil, bundle: nil)
     }
@@ -288,6 +302,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         actionExecutor.dialog.reset()
         capturedMode = context.mode; forcedFileInput = nil
         queryRoute = .files(searchField.text)
+        activatedPinyin = nil
         session.begin(source: source, context: context); _ = generation.next()
         cancelPendingOpen(); results.cancelPendingRefresh(); quickLook.close(); previewRequest = nil
         footer.contextText = L10n.text("session." + context.mode.rawValue)
@@ -631,6 +646,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             case .copyName: footer.showToast(.copiedName, value: request.target.name)
             case .copyFile: footer.showMessage("action.copiedFile", value: request.target.name, snapshot: snapshot)
             case .trash: footer.showToast(.trashed, value: request.target.name)
+            case .rename, .createDirectory: footer.showMessage("custom.mutated", snapshot: snapshot)
             default: break
             }
         case .cancelled(let failure), .failed(let failure):
@@ -656,6 +672,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                 item.isEnabled = request.map { actionExecutor.validate($0) == nil } ?? false
                 menu.addItem(item)
             }
+            appendCustomActions(to: menu, paletteItem: paletteItem)
             return menu
         }
         let actions: [FileAction?] = [.open, .reveal, .preview, nil, .copyFile, .copyPath, .copyName, nil, .trash, nil, .contextNavigation]
@@ -675,7 +692,139 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         favorite.isEnabled = results.selectedItem?.kind == 1 && (favorite.representedObject as? ActionRequest).map { actionExecutor.validate($0) == nil } == true
         let position = menu.items.count - 1
         menu.insertItem(favorite, at: position); menu.insertItem(.separator(), at: position + 1)
+        let contextNavigation = menu.items.last!
+        menu.removeItem(contextNavigation)
+        appendCustomActions(to: menu, paletteItem: results.selectedPaletteItem)
+        for action in [FileAction.rename, .createDirectory] {
+            let item = NSMenuItem(title: L10n.text("ctx." + action.rawValue), action: #selector(mutationAction(_:)), keyEquivalent: "")
+            item.target = self
+            if let request = requestAction(action) {
+                let mutation = FileMutation(request: request)
+                item.representedObject = mutation
+                let failure = actionExecutor.validate(request) ?? FileActions.availability(mutation)
+                item.isEnabled = failure == nil; item.toolTip = failure.map { L10n.text("action." + $0.rawValue) }
+            } else { item.isEnabled = false }
+            menu.addItem(item)
+        }
+        appendSavedFilters(to: menu)
+        menu.addItem(.separator()); menu.addItem(contextNavigation)
         return menu
+    }
+    private func appendCustomActions(to menu: NSMenu, paletteItem: PaletteItem?) {
+        let type: ActionItemType
+        switch paletteItem {
+        case .application: type = .application
+        case .web: type = .web
+        default: type = .file
+        }
+        let definitions = customActions.actions.filter { $0.itemTypes.contains(type) }
+        guard type == .file || !definitions.isEmpty else { return }
+        menu.addItem(.separator())
+        if type == .file {
+            let open = NSMenuItem(title: L10n.text("ctx.openWith"), action: #selector(chooseApplication(_:)), keyEquivalent: "")
+            open.target = self; open.representedObject = requestAction(.custom)
+            open.isEnabled = (open.representedObject as? ActionRequest).map { actionExecutor.validate($0) == nil } ?? false
+            menu.addItem(open)
+            let terminal = NSMenuItem(title: L10n.text("ctx.terminal"), action: nil, keyEquivalent: "")
+            terminal.isEnabled = false; terminal.toolTip = L10n.text("action.terminalUnsupported"); menu.addItem(terminal)
+        }
+        if customActions.error != nil {
+            let error = NSMenuItem(title: L10n.text("custom.configError"), action: nil, keyEquivalent: "")
+            error.isEnabled = false; menu.addItem(error)
+        }
+        for definition in definitions {
+            let item = NSMenuItem(title: definition.name, action: #selector(customContextAction(_:)), keyEquivalent: "")
+            item.target = self
+            let request: CustomActionRequest?
+            if let file = requestAction(.custom) { request = actionExecutor.captureCustom(definition, file: file) }
+            else if let paletteItem { request = actionExecutor.captureCustom(definition, item: paletteItem) }
+            else { request = nil }
+            item.representedObject = request
+            let failure = request.map { actionExecutor.validate($0) } ?? .unsupportedAction
+            item.isEnabled = request != nil && failure == nil
+            item.toolTip = failure.map { L10n.text("action." + $0.rawValue) }
+            menu.addItem(item)
+        }
+    }
+    @objc func customContextAction(_ item: NSMenuItem) {
+        guard !searchField.editor.hasMarkedText(), let request = item.representedObject as? CustomActionRequest else { return }
+        actionExecutor.execute(request)
+    }
+    @objc private func chooseApplication(_ item: NSMenuItem) {
+        actionModalActive = true; defer { actionModalActive = false }
+        guard let request = item.representedObject as? ActionRequest else { return }
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false; panel.allowedContentTypes = [.application]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let definition = ActionDefinition(id: UUID(), name: url.deletingPathExtension().lastPathComponent,
+            itemTypes: [.file], modes: SearchMode.allActionModes, permissions: [.fileRead], enabled: true, execution: .application(url))
+        if let custom = actionExecutor.captureCustom(definition, file: request) {
+            do { try customActions.set(customActions.actions + [definition]) }
+            catch { footer.showMessage("custom.configError", snapshot: snapshot); return }
+            actionExecutor.execute(custom)
+        }
+    }
+    @objc private func mutationAction(_ item: NSMenuItem) {
+        actionModalActive = true; defer { actionModalActive = false }
+        guard let mutation = item.representedObject as? FileMutation else { return }
+        let alert = NSAlert(); alert.messageText = L10n.text("ctx." + mutation.request.action.rawValue)
+        alert.informativeText = mutation.parent.path
+        let input = NSTextField(string: mutation.request.action == .rename ? mutation.request.target.name : "")
+        input.frame = NSRect(x: 0, y: 0, width: 340, height: 24); alert.accessoryView = input
+        alert.addButton(withTitle: L10n.text("launcher.save")); alert.addButton(withTitle: L10n.text("custom.cancel"))
+        alert.window.initialFirstResponder = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        actionExecutor.execute(mutation, name: input.stringValue)
+    }
+    private func appendSavedFilters(to menu: NSMenu) {
+        menu.addItem(.separator())
+        let save = NSMenuItem(title: L10n.text("saved.saveCurrent"), action: #selector(saveCurrentFilterMenu), keyEquivalent: "")
+        save.target = self
+        if case .files = routeInput() { save.isEnabled = !searchField.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        else { save.isEnabled = false }
+        menu.addItem(save)
+        if savedFilters.error != nil {
+            let error = NSMenuItem(title: L10n.text("saved.error"), action: nil, keyEquivalent: "")
+            error.isEnabled = false; menu.addItem(error)
+        }
+        for filter in savedFilters.filters {
+            let item = NSMenuItem(title: filter.name, action: #selector(activateFilterMenu(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = filter; menu.addItem(item)
+        }
+    }
+    func saveCurrentFilter(name: String) throws {
+        guard case .files = routeInput() else { throw SavedFiltersStore.StoreError.invalidFilter }
+        let filter = SavedFilter(name: name, query: searchField.text, options: effectiveOptions)
+        try savedFilters.set(savedFilters.filters + [filter])
+    }
+    @objc private func saveCurrentFilterMenu() {
+        actionModalActive = true; defer { actionModalActive = false }
+        let alert = NSAlert(); alert.messageText = L10n.text("saved.saveCurrent")
+        let input = NSTextField(string: searchField.text); input.frame = NSRect(x: 0, y: 0, width: 340, height: 24)
+        alert.accessoryView = input; alert.addButton(withTitle: L10n.text("launcher.save")); alert.addButton(withTitle: L10n.text("custom.cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do { try saveCurrentFilter(name: input.stringValue) } catch { footer.showMessage("saved.error", snapshot: snapshot) }
+    }
+    @objc private func activateFilterMenu(_ item: NSMenuItem) {
+        guard let filter = item.representedObject as? SavedFilter else { return }
+        do { try activateFilter(filter) } catch { footer.showMessage("saved.unavailable", snapshot: snapshot) }
+    }
+    func activateFilter(_ filter: SavedFilter) throws {
+        let sources = snapshot ? snapshotSources : searchSources
+        _ = try filter.parse(store: sources.first?.store)
+        guard let options = filter.options else { throw SavedFiltersStore.StoreError.invalidFilter }
+        if let scope = options.directoryScope {
+            let directory = URL(fileURLWithPath: scope.path, isDirectory: true)
+            guard favorites.system.check(directory) == .available,
+                  sources.contains(where: { $0.isOnline && Searcher.directoryScopeIsAvailable(scope, in: $0.store) }) else {
+                throw SavedFiltersStore.StoreError.unavailableScope
+            }
+        }
+        session.setMode(.ordinary)
+        session.setDirectoryScope(options.directoryScope.map { URL(fileURLWithPath: $0.path, isDirectory: true) })
+        filters.options = options; activatedPinyin = options.pinyin
+        searchField.text = filter.query; forcedFileInput = filter.query
+        results.clear(); updateDirectoryControls(); startSearch()
     }
     @objc func contextAction(_ item: NSMenuItem) {
         guard let request = item.representedObject as? ActionRequest else { return }
@@ -734,7 +883,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         default: break
         }
         options.directoryScope = session.directoryScope.map { DirectoryScope(path: $0.path) }
-        if !snapshot { options.pinyin = UserDefaults.standard.bool(forKey: "pinyinEnabled") }
+        if let activatedPinyin { options.pinyin = activatedPinyin }
+        else if !snapshot { options.pinyin = UserDefaults.standard.bool(forKey: "pinyinEnabled") }
         return options
     }
     private func routeInput() -> QueryRoute {
@@ -932,7 +1082,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     private func hideIfInactive() {
-        if session.isActive && pendingOpen == nil && !actionExecutor.dialog.isNavigating && view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging { hidePanel?() }
+        if session.isActive && pendingOpen == nil && !actionExecutor.dialog.isNavigating && view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging && !actionModalActive { hidePanel?() }
     }
     func windowDidResignKey(_ notification: Notification) {
         // Quick Look visibility settles after the key-window transition.

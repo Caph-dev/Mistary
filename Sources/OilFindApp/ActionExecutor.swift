@@ -4,7 +4,7 @@ import OilFindCore
 
 /// Path copy preserves the existing URL + text format; file copy is URL-only.
 enum FileAction: String, CaseIterable {
-    case open, reveal, preview, copyFile, copyPath, copyName, trash, contextNavigation
+    case open, reveal, preview, copyFile, copyPath, copyName, trash, contextNavigation, custom, rename, createDirectory
     var requiresOnline: Bool { self != .copyPath && self != .copyName }
 }
 
@@ -12,11 +12,14 @@ enum ActionFailure: String, Error {
     case staleSession, sourceUnavailable, storeReplaced, targetChanged, fileUnavailable
     case systemRejected, clipboardRejected, trashNotVerified, contextUnavailable, alreadyDispatched, superseded
     case applicationUnavailable, invalidURL, unsupportedAction, dialogManual, dialogFailed
+    case permissionDenied, terminalUnsupported, executableUnavailable, commandLaunchFailed, commandFailed, commandTimedOut
+    case commandOutputFailed
+    case invalidName, destinationExists, symlinkUnsupported, caseRenameUnsupported, mutationNotVerified
 }
 
 enum ActionOutcome: Equatable {
-    /// Only trash has a subsequent terminal event. Workspace and Quick Look
-    /// acceptance does not prove that an external application read the file.
+    /// Asynchronous operations may have a terminal event after acceptance.
+    /// Workspace and Quick Look acceptance does not prove an external read.
     case accepted
     case verified
     case cancelled(ActionFailure)
@@ -102,6 +105,19 @@ struct ActionSystem {
     }
     var open: (URL) -> Bool = { NSWorkspace.shared.open($0) }
     var launcher = LauncherSystem()
+    // A configured script runs as the current user, without an extra TCC category
+    // or sandbox. Hosts may deny capabilities; file access is checked separately.
+    var permission: (ActionPermission) -> Bool = { _ in true }
+    var readable: (URL) -> Bool = { FileManager.default.isReadableFile(atPath: $0.path) }
+    var executable: (URL) -> Bool = { url in
+        url.isFileURL && FileManager.default.isExecutableFile(atPath: url.path)
+            && (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+    }
+    var openWith: (URL, URL, @escaping (Bool) -> Void) -> Void = { file, app, completion in
+        NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration()) { running, error in
+            DispatchQueue.main.async { completion(running != nil && error == nil) }
+        }
+    }
     var launch: (URL, @escaping (Bool) -> Void) -> Void = { url, completion in
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { app, error in
             DispatchQueue.main.async { completion(app != nil && error == nil) }
@@ -138,11 +154,19 @@ final class ActionExecutor {
     var onEvent: ((ActionEvent) -> Void)?
     var onPaletteEvent: ((PaletteActionEvent) -> Void)?
     var dialog = DialogAdapter()
+    var fileActions = FileActions()
+    var commandRunner = CommandRunner()
+    var runCommand: ((CommandInvocation, @escaping (CommandEvent) -> Void) -> Void)?
+    var onCustomEvent: ((CustomActionEvent) -> Void)?
     private var trashing: Set<URL> = []
+    private var mutationPermits: [UUID: FileMutationPermit] = [:]
 
     init(session: SearchSession, system: ActionSystem = ActionSystem(), sources: @escaping () -> [SearchSource]) {
         self.session = session; self.system = system; self.sources = sources
-        session.onInvalidate = { [weak self] in self?.dialog.cancel() }
+        session.onInvalidate = { [weak self] in
+            self?.dialog.cancel()
+            self?.mutationPermits.values.forEach { $0.cancel() }
+        }
     }
     func capture(_ action: FileAction, paletteItem: PaletteItem) -> PaletteActionRequest? {
         guard paletteItem.actions.contains(action) else { return nil }
@@ -286,10 +310,101 @@ final class ActionExecutor {
             }
             return .accepted
         case .contextNavigation: return emit(request, .failed(.contextUnavailable))
+        case .custom, .rename, .createDirectory: return emit(request, .failed(.unsupportedAction))
+        }
+    }
+    func captureCustom(_ definition: ActionDefinition, file: ActionRequest) -> CustomActionRequest? {
+        guard file.action == .custom else { return nil }
+        let binding = ActionBinding(type: .file, url: file.target.url, name: file.target.name,
+                                    directory: file.target.isDirectory ? file.target.url : file.target.url.deletingLastPathComponent())
+        return CustomActionRequest(definition: definition, file: file, palette: nil, binding: binding, mode: file.context.mode)
+    }
+    func captureCustom(_ definition: ActionDefinition, item: PaletteItem) -> CustomActionRequest? {
+        guard let palette = capture(.open, paletteItem: item) else { return nil }
+        let binding: ActionBinding
+        switch item {
+        case .file: return nil
+        case .application(let app): binding = ActionBinding(type: .application, url: app.url, name: app.name, directory: app.url.deletingLastPathComponent())
+        case .web(let web): binding = ActionBinding(type: .web, url: web.url, name: web.text, directory: nil)
+        }
+        return CustomActionRequest(definition: definition, file: nil, palette: palette, binding: binding, mode: session.context.mode)
+    }
+    func validate(_ request: CustomActionRequest) -> ActionFailure? {
+        if let file = request.file, let failure = validate(file) { return failure }
+        if let palette = request.palette, let failure = validate(palette) { return failure }
+        if request.definition.permissions.contains(.fileRead), request.binding.url.isFileURL,
+           !system.readable(request.binding.url) { return .permissionDenied }
+        return request.definition.unavailableReason(binding: request.binding, mode: request.mode,
+            permission: system.permission, application: system.launcher.isApplication, executable: system.executable)
+    }
+    func execute(_ request: CustomActionRequest) {
+        let consumed = request.file?.receipt.consume() ?? request.palette?.receipt.consume() ?? false
+        guard consumed else { return }
+        func report(_ outcome: ActionOutcome) { onCustomEvent?(CustomActionEvent(request: request, outcome: outcome)) }
+        if let failure = validate(request) { report(.cancelled(failure)); return }
+        switch request.definition.execution {
+        case .application(let app):
+            var completed = false
+            system.openWith(request.binding.url, app) { [self] accepted in
+                guard !completed else { return }; completed = true
+                onCustomEvent?(CustomActionEvent(request: request, outcome: accepted ? .accepted : .failed(.systemRejected)))
+            }
+        case .urlTemplate:
+            guard let url = try? request.definition.boundURL(request.binding) else { report(.failed(.invalidURL)); return }
+            report(system.open(url) ? .accepted : .failed(.systemRejected))
+        case .command:
+            guard let invocation = try? CommandInvocation(definition: request.definition, binding: request.binding) else {
+                report(.failed(.unsupportedAction)); return
+            }
+            var started = false, finished = false
+            let callback: (CommandEvent) -> Void = { [self] event in
+                guard !finished else { return }
+                switch event {
+                case .started:
+                    guard !started else { return }; started = true
+                    onCustomEvent?(CustomActionEvent(request: request, outcome: .accepted))
+                case .cancelled(let failure):
+                    finished = true
+                    onCustomEvent?(CustomActionEvent(request: request, outcome: .cancelled(failure)))
+                case .finished(let result):
+                    finished = true
+                    onCustomEvent?(CustomActionEvent(request: request, outcome: result.outcome))
+                }
+            }
+            if let runCommand { runCommand(invocation, callback) } else { commandRunner.run(invocation, authorize: { [self] in validate(request) }, event: callback) }
+        case .terminal: report(.failed(.terminalUnsupported))
+        }
+    }
+    func execute(_ mutation: FileMutation, name: String) {
+        let request = mutation.request
+        guard request.receipt.consume() else { return }
+        if let failure = validate(request) { emit(request, .cancelled(failure)); return }
+        if let failure = FileActions.availability(mutation) { emit(request, .failed(failure)); return }
+        // Main-thread source/session validation immediately precedes queue dispatch.
+        // The worker receives immutable snapshots and rechecks disk identity.
+        let permit = FileMutationPermit()
+        mutationPermits[request.actionID] = permit
+        fileActions.perform(mutation, name: name, authorize: { [self] in validate(request) }, begin: { permit.begin() }) { [self] outcome in
+            mutationPermits.removeValue(forKey: request.actionID)
+            emit(request, outcome)
         }
     }
     @discardableResult
     private func emit(_ request: ActionRequest, _ outcome: ActionOutcome) -> ActionOutcome {
         onEvent?(ActionEvent(request: request, outcome: outcome)); return outcome
     }
+}
+
+struct CustomActionRequest {
+    let definition: ActionDefinition
+    let file: ActionRequest?
+    let palette: PaletteActionRequest?
+    let binding: ActionBinding
+    let mode: SearchMode
+    var token: SearchSessionToken { file?.token ?? palette!.token }
+    var actionID: UUID { file?.actionID ?? palette!.actionID }
+}
+struct CustomActionEvent {
+    let request: CustomActionRequest
+    let outcome: ActionOutcome
 }
