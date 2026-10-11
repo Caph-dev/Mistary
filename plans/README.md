@@ -14,7 +14,7 @@
 4. [004：Finder、精确目录范围与收藏](004-finder-scope-favorites.md) — **已完成（按操作者决定，真实 Finder／Automation 验收及同机性能测量暂缓）**。P1 / L / 中风险。依赖：003。阶段 M1。实现提交：`e4b7dd35f5b9fc6581a7635b625ec9bcd62d87f9`。指定测试 41 项、补充回归 34 项、公开边界脚本 2 项及 Release 构建通过；交付严格 scope、Finder 上下文和收藏／目录候选，尚未执行跨应用导航。证据：[004-finder-scope.md](evidence/004-finder-scope.md)。
 5. [005：打开／保存对话框工作流](005-dialog-workflows.md) — **已完成（按操作者授权，完成手动路线；跨应用真机验收暂缓）**。P1 / L / 高风险。依赖：002、003、004。阶段 M1。实现提交：`fcb31c6944727ac95647e43bd49627008c6432d0`。指定测试86项、补充回归47项、Release回归49项及公开边界脚本2项通过；Release／调试包、签名和中英文界面快照已验证。AX关卡仍未判定，自动导航支持集合为空，完整M1自动目标仍待。证据：[005-dialog-workflows.md](evidence/005-dialog-workflows.md)。
 6. [006：应用别名、网页关键字与结果类型](006-launcher-query-routing.md) — **已完成（按操作者决定，真实应用／浏览器／输入法日用验收暂缓）**。P2 / M / 中风险。硬依赖：003；已保留004目录范围与收藏；005随后完成手动交接，自动导航仍未开放。阶段 M2。实现提交：`fc53d01b347d81b7faad5fcd8f633652b12582a6`。指定测试53项、Finder及相关回归27项、公开边界脚本2项、Release编译与调试快照通过。证据：[006-launcher-query-routing.md](evidence/006-launcher-query-routing.md)。
-7. [007：自定义动作与单文件操作](007-custom-file-actions.md) — **待执行**。P2 / L / 中至高风险。硬依赖：003、006；目录过滤器集成004。阶段 M2。证据：未生成。
+7. [007：自定义动作与单文件操作](007-custom-file-actions.md) — **已完成（按操作者授权，跨应用与终端真机验收暂缓）**。P2 / L / 中至高风险。硬依赖：003、006；目录过滤器已集成004。阶段 M2。实现提交：`8974b820e10d5a74e1f20ba2bf05534e1b145282`。指定测试71项、补充回归72项及公开边界脚本2项通过；Release／调试包、签名与中英文设置快照已验证。终端保持unsupported，未增加Automation权限。证据：[007-actions.md](evidence/007-actions.md)。
 8. [008：使用历史与候选排序](008-usage-ranking.md) — **待执行**。P2 / L / 中风险。硬依赖：003、004、006；007的动作统计可后接。阶段 M3。证据：未生成。
 9. [009：常驻面板与最终日用验收](009-panel-polish-acceptance.md) — **待执行**。P2 / M / 中风险。窗口代码硬依赖003；最终联合验收依赖004、005、006、007、008。阶段 M3 收尾。证据：未生成。
 
@@ -66,7 +66,7 @@
 - 注释英文；L10n中文/英文成对维护；索引读锁内不做I/O，热循环不逐项String/堆分配。
 - 一次捕获的动作校验同一文件目标，不拿后来选中的行代替；accepted不代表目标app已读取文件。
 - 文件修改不覆盖，默认删除进废纸篓。真实安装/卸载、证书创建、Git提交/推送不自动执行。
-- 规划阶段未运行 Swift 测试、构建或真实 AX 实验；001、002、003、004、005、006 实施后的实际验证记录分别见 [隔离证据](evidence/001-isolation.md)、[AX 证据](evidence/002-ax-compatibility.md)、[会话及动作证据](evidence/003-search-session-actions.md)、[Finder／范围／收藏证据](evidence/004-finder-scope.md)、[对话框工作流证据](evidence/005-dialog-workflows.md) 与 [启动器路由证据](evidence/006-launcher-query-routing.md)。007～009 的命令与新增测试仍为未来验证项。测试零匹配不算通过。
+- 规划阶段未运行 Swift 测试、构建或真实 AX 实验；001、002、003、004、005、006 实施后的实际验证记录分别见 [隔离证据](evidence/001-isolation.md)、[AX 证据](evidence/002-ax-compatibility.md)、[会话及动作证据](evidence/003-search-session-actions.md)、[Finder／范围／收藏证据](evidence/004-finder-scope.md)、[对话框工作流证据](evidence/005-dialog-workflows.md) 、[启动器路由证据](evidence/006-launcher-query-routing.md) 与 [动作证据](evidence/007-actions.md)。008～009 的命令与新增测试仍为未来验证项。测试零匹配不算通过。
 - 更新状态需有可读证据。建议将实际记录写入各计划指定的 `plans/evidence/`；本轮不预建空证据或伪造支持清单。
 
 ## 验证层次

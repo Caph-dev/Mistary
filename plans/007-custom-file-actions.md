@@ -2,10 +2,12 @@
 
 ## 状态
 
-- 状态：待执行。
+- 状态：**已完成（按操作者授权，跨应用与终端真机验收暂缓）**。
+- 实现提交：`8974b820e10d5a74e1f20ba2bf05534e1b145282`；2026-10-11。指定测试 71 项、补充回归 72 项，共 143 项通过；Release／调试包、签名及公开边界检查通过。
+- 实施证据：[evidence/007-actions.md](evidence/007-actions.md)。Terminal 尚无真实支持证据，保持 unsupported；未验证项没有记为通过。
 - P2；工作量 L；风险中到高；阶段 M2；依赖：003-search-session-actions.md 的不可变ActionRequest；006-launcher-query-routing.md 的PaletteItem和配置。004只为保存目录scope的集成输入。
 - 规划于：commit `6c024bbbf6b917c4a334f4569de070d887ecd66f`；2026-10-10。
-- 本文件是实施规格，不是已实现/已测试报告。
+- 本文件保留实施规格；本轮已实现／已测试报告与暂缓项以实施证据为准。
 
 ## 执行约定
 
@@ -26,7 +28,7 @@
 
 ## 验证规则
 
-本文件中的实施命令本轮尚未运行。新测试类和证据文件均为待创建，不代表当前已存在。每条测试命令必须 exit 0、匹配到预期测试且全部通过；零测试不算通过。每步失败先报告关键错误，同类失败两次后咨询 advisor 或操作者，再调整方案。
+下文命令保留为实施规格；本轮运行结果、新增测试类和实际证据见 [007-actions.md](evidence/007-actions.md)。每条测试命令必须 exit 0、匹配到预期测试且全部通过；零测试不算通过。每步失败先报告关键错误，同类失败两次后咨询 advisor 或操作者，再调整方案。
 
 使用 OILFIND_FREE=1 运行 Swift 验证。每个逻辑步骤后完成最窄检查；阶段末执行 OILFIND_FREE=1 swift build -c release。完成标准还包括：git diff --check 无空白错误，git status --short 中实现改动均属于列出的范围（以及本计划的状态/证据记录）。
 
@@ -56,7 +58,7 @@ git diff --stat 6c024bbbf6b917c4a334f4569de070d887ecd66f..HEAD -- Sources/OilFin
 
 文件结果应该直接承载自己的常用操作。先支持少量声明式动作与单文件改动，避免每次切回Finder，也避免过早引入插件系统。所有执行仍绑定003的发起目标；路径必须作为数据传递，不能拼进shell源码。
 
-## 当前状态与证据
+## 规划时状态与证据（历史）
 
 Sources/OilFindApp/SearchViewController.swift 当前上下文菜单来自固定数组：
 
@@ -64,7 +66,7 @@ Sources/OilFindApp/SearchViewController.swift 当前上下文菜单来自固定�
 ["open", "reveal", "preview", "-", "copyPath", "copyName", "-", "trash"]
 ~~~
 
-目前打开使用 NSWorkspace.shared.open，废纸篓使用 NSWorkspace.shared.recycle。没有指定应用、终端、可配置命令、新建目录、重命名和保存过滤器。SettingsWindow.swift 的 SettingsModel 是 ObservableObject，界面文案集中在 L10n，继续沿用该结构。
+规划基底的打开使用 NSWorkspace.shared.open，废纸篓使用 NSWorkspace.shared.recycle。当时没有指定应用、终端、可配置命令、新建目录、重命名和保存过滤器；本轮交付与限制见实施证据。SettingsWindow.swift 的 SettingsModel 是 ObservableObject，界面文案集中在 L10n，继续沿用该结构。
 
 ## 前置交付与动作契约
 
@@ -120,11 +122,11 @@ CommandRunner用Process的executableURL、arguments和可选currentDirectoryURL�
 
 ## 完成标准
 
-- [ ] 参数、权限、动作类型和目标快照测试通过；所有命令显式触发。
-- [ ] 指定应用和终端有真实支持证据；unsupported不是虚报成功。
-- [ ] 新建/重命名使用不覆盖语义，包含竞态/冲突/失败保留原文件的测试。
-- [ ] 保存过滤器在激活时完整重新parse并遵守目录scope。
-- [ ] 记录plans/evidence/007-actions.md及使用的终端协议/权限，不写用户脚本秘密。
+- [x] 参数、权限、动作类型和目标快照测试通过；所有命令显式触发。
+- [ ] 指定应用和终端真实支持证据：按操作者授权暂缓。指定应用仅报告 accepted；终端保持 unsupported，不虚报成功。
+- [x] 新建/重命名使用不覆盖语义，包含竞态/冲突/失败保留原文件的测试；源身份校验与 rename 间的 POSIX 竞态边界已记录。
+- [x] 保存过滤器在激活时完整重新parse并遵守目录scope。
+- [x] 记录 plans/evidence/007-actions.md；终端支持集合为空，无新增 Automation 请求，不写用户脚本秘密。
 
 ## 停止条件
 
