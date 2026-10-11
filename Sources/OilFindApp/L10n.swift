@@ -38,6 +38,18 @@ enum L10n {
         }
     }
     private static let strings: [String: (String, String)] = [
+        "usage.settings": ("使用历史", "Usage History"),
+        "usage.enabled": ("记录本应用的使用历史", "Record usage in this app"),
+        "usage.privacy": ("仅记录 Mistary 的动作，最多保留 1000 个目标。文件历史包含路径、书签和近期查询；网页仅保存关键字标识，不保存搜索正文或网址。自定义动作 recordsUsage 记录进程启动，退出结果另行报告。", "Only Mistary actions are recorded, for up to 1,000 targets. File history includes paths, bookmarks and recent queries. Web history stores keyword IDs without search text or URLs. Custom recordsUsage records process launch; exit results are reported separately."),
+        "usage.clear": ("清除使用历史", "Clear usage history"),
+        "usage.error": ("无法读取或保存历史，可清除后重试。", "History could not be read or saved. Clear it to retry."),
+        "usage.recent": ("最近使用", "Recently Used"),
+        "usage.modified": ("最近修改", "Recently Modified"),
+        "usage.initiated": ("已发起", "Initiated"),
+        "usage.navigated": ("已导航", "Navigated"),
+        "usage.copied": ("已复制", "Copied"),
+        "usage.emptyFooter": ("收藏 · 最近使用 · 最近修改", "Favorites · Recently Used · Recently Modified"),
+        "usage.footer": ("使用排序候选 %@ 项，共 %@ 个文件", "Usage ranking candidates: %@, %@ files total"),
         "ctx.custom": ("自定义操作", "Custom Action"),
         "ctx.rename": ("重命名…", "Rename…"),
         "ctx.createDirectory": ("新建目录…", "New Folder…"),

@@ -8,6 +8,7 @@ struct ResultItem {
     let source: SearchSource
     let name: String, parentPath: String, path: String
     let size: UInt64, modified: Date, flags: UInt8, kind: UInt8
+    var usageGroup: String? = nil
 }
 
 private final class ResultRow: NSTableRowView {
@@ -73,7 +74,7 @@ final class ResultCell: NSTableCellView {
         switch item {
         case .application(let app):
             nameLabel.attributedStringValue = NSAttributedString(string: app.name, attributes: [.font: nameLabel.font!, .foregroundColor: app.available ? NSColor.labelColor : NSColor.tertiaryLabelColor])
-            pathLabel.stringValue = app.url.path + (app.available ? "" : " · " + L10n.text("launcher.missing"))
+            pathLabel.stringValue = (app.usageGroup.map { L10n.text($0) + " · " } ?? "") + app.url.path + (app.available ? "" : " · " + L10n.text("launcher.missing"))
             toolTip = app.url.path
             icon.image = icons.icon(name: app.url.lastPathComponent, path: app.url.path, flags: SiftFlag.dir | SiftFlag.package, kind: 2, resolveFileIcon: app.available) { [weak self] image in
                 guard let self, self.configuration == token else { return }; self.icon.image = image
@@ -97,7 +98,7 @@ final class ResultCell: NSTableCellView {
             name.addAttributes([.foregroundColor: NSColor.controlAccentColor, .font: NSFont.systemFont(ofSize: 13.5, weight: .semibold)], range: range)
         }
         nameLabel.attributedStringValue = name
-        pathLabel.stringValue = Presentation.abbreviate(path: item.parentPath, home: NSHomeDirectory()) + (item.source.isOnline ? "" : " · " + L10n.text("source.offline"))
+        pathLabel.stringValue = (item.usageGroup.map { L10n.text($0) + " · " } ?? "") + Presentation.abbreviate(path: item.parentPath, home: NSHomeDirectory()) + (item.source.isOnline ? "" : " · " + L10n.text("source.offline"))
         detailLabel.isHidden = item.detail == nil
         detailLabel.stringValue = ""
         if let detail = item.detail {
@@ -369,9 +370,11 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
         let store = hit.source.store, id = hit.id
         return store.read {
             guard Int(id) < store.count, store.isLive(id) else { return nil }
-            let name = store.name(id), parent = store.parentPath(id)
-            return ResultItem(detail: result.detail(at: index), id: id, source: source, name: name, parentPath: parent, path: parent == "/" ? "/" + name : parent + "/" + name,
-                              size: store.size(id), modified: store.modified(id), flags: store.flags[Int(id)], kind: store.kind[Int(id)])
+            let name = id == 0 ? URL(fileURLWithPath: store.rootPath).lastPathComponent : store.name(id)
+            let parent = id == 0 ? URL(fileURLWithPath: store.rootPath).deletingLastPathComponent().path : store.parentPath(id)
+            return ResultItem(detail: result.detail(at: index), id: id, source: source, name: name, parentPath: parent,
+                              path: id == 0 ? store.rootPath : parent == "/" ? "/" + name : parent + "/" + name,
+                              size: store.size(id), modified: store.modified(id), flags: store.flags[Int(id)], kind: store.kind[Int(id)], usageGroup: result.usageGroup(at: index))
         }
     }
     var selectedItem: ResultItem? { item(at: selectedRow) }

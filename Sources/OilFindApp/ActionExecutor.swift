@@ -31,8 +31,8 @@ struct ActionEvent {
     let outcome: ActionOutcome
 }
 
-struct FileIdentity: Equatable {
-    struct Node: Equatable {
+struct FileIdentity: Equatable, Codable {
+    struct Node: Equatable, Codable {
         let device: Int32
         let inode: UInt64
         let birthSeconds: Int
@@ -64,10 +64,15 @@ struct FileTargetSnapshot {
     let name: String
     let identity: FileIdentity?
     let isDirectory: Bool
+    var isApplication = false
 }
 
 fileprivate final class ActionReceipt {
     var dispatched = false
+    var usageRecorded = false
+    func claimUsage() -> Bool {
+        guard !usageRecorded else { return false }; usageRecorded = true; return true
+    }
     func consume() -> Bool {
         guard !dispatched else { return false }; dispatched = true; return true
     }
@@ -80,6 +85,9 @@ struct ActionRequest {
     let action: FileAction
     let target: FileTargetSnapshot
     let context: SearchContext
+    var navigationIdentity: FileIdentity?
+    var query = ""
+    var usageEpoch: UInt64?
 }
 
 struct PaletteActionRequest {
@@ -89,6 +97,8 @@ struct PaletteActionRequest {
     let action: FileAction
     let item: PaletteItem
     let identity: FileIdentity?
+    var query = ""
+    var usageEpoch: UInt64?
 }
 
 struct PaletteActionEvent {
@@ -158,6 +168,9 @@ final class ActionExecutor {
     var commandRunner = CommandRunner()
     var runCommand: ((CommandInvocation, @escaping (CommandEvent) -> Void) -> Void)?
     var onCustomEvent: ((CustomActionEvent) -> Void)?
+    var usage: UsageStore?
+    var query: () -> String = { "" }
+    var directoryQuery: (() -> String)?
     private var trashing: Set<URL> = []
     private var mutationPermits: [UUID: FileMutationPermit] = [:]
 
@@ -176,7 +189,8 @@ final class ActionExecutor {
         case .application(let app): identity = action.requiresOnline ? system.identity(app.url) : nil
         case .web: identity = nil
         }
-        return PaletteActionRequest(actionID: UUID(), token: session.token, action: action, item: paletteItem, identity: identity)
+        return PaletteActionRequest(actionID: UUID(), token: session.token, action: action, item: paletteItem, identity: identity,
+                                    query: query(), usageEpoch: usage?.epoch)
     }
     func validate(_ request: PaletteActionRequest) -> ActionFailure? {
         guard session.isCurrent(request.token) else { return .staleSession }
@@ -223,6 +237,7 @@ final class ActionExecutor {
     }
     @discardableResult
     private func emit(_ request: PaletteActionRequest, _ outcome: ActionOutcome) -> ActionOutcome {
+        recordUsage(request, outcome: outcome)
         onPaletteEvent?(PaletteActionEvent(request: request, outcome: outcome)); return outcome
     }
     func capture(_ action: FileAction, item: ResultItem) -> ActionRequest? {
@@ -237,11 +252,14 @@ final class ActionExecutor {
         let current = sources().first { $0.id == item.source.id }
         let identity = action.requiresOnline && item.source.isOnline && current?.isOnline == true && current?.store === store
             ? system.identity(url) : nil
+        let navigates = action == .contextNavigation || (action == .open && (session.context.mode == .open || session.context.mode == .save))
+        let directory = item.kind == 1 ? url : url.deletingLastPathComponent()
+        let navigationIdentity = navigates && current?.isOnline == true ? system.identity(directory) : nil
         return ActionRequest(actionID: UUID(), token: session.token, action: action,
                              target: FileTargetSnapshot(sourceID: item.source.id, sourceName: item.source.displayName,
                                                         wasOnline: item.source.isOnline, store: store, storeVersion: version,
-                                                        entryID: item.id, url: url, name: item.name, identity: identity, isDirectory: item.kind == 1),
-                             context: session.context)
+                                                        entryID: item.id, url: url, name: item.name, identity: identity, isDirectory: item.kind == 1, isApplication: item.kind == 2),
+                             context: session.context, navigationIdentity: navigationIdentity, query: query(), usageEpoch: usage?.epoch)
     }
     func validate(_ request: ActionRequest) -> ActionFailure? {
         guard session.isCurrent(request.token) else { return .staleSession }
@@ -340,14 +358,14 @@ final class ActionExecutor {
     func execute(_ request: CustomActionRequest) {
         let consumed = request.file?.receipt.consume() ?? request.palette?.receipt.consume() ?? false
         guard consumed else { return }
-        func report(_ outcome: ActionOutcome) { onCustomEvent?(CustomActionEvent(request: request, outcome: outcome)) }
+        func report(_ outcome: ActionOutcome) { emitCustom(request, outcome) }
         if let failure = validate(request) { report(.cancelled(failure)); return }
         switch request.definition.execution {
         case .application(let app):
             var completed = false
             system.openWith(request.binding.url, app) { [self] accepted in
                 guard !completed else { return }; completed = true
-                onCustomEvent?(CustomActionEvent(request: request, outcome: accepted ? .accepted : .failed(.systemRejected)))
+                emitCustom(request, accepted ? .accepted : .failed(.systemRejected))
             }
         case .urlTemplate:
             guard let url = try? request.definition.boundURL(request.binding) else { report(.failed(.invalidURL)); return }
@@ -362,13 +380,13 @@ final class ActionExecutor {
                 switch event {
                 case .started:
                     guard !started else { return }; started = true
-                    onCustomEvent?(CustomActionEvent(request: request, outcome: .accepted))
+                    emitCustom(request, .accepted)
                 case .cancelled(let failure):
                     finished = true
-                    onCustomEvent?(CustomActionEvent(request: request, outcome: .cancelled(failure)))
+                    emitCustom(request, .cancelled(failure))
                 case .finished(let result):
                     finished = true
-                    onCustomEvent?(CustomActionEvent(request: request, outcome: result.outcome))
+                    emitCustom(request, result.outcome)
                 }
             }
             if let runCommand { runCommand(invocation, callback) } else { commandRunner.run(invocation, authorize: { [self] in validate(request) }, event: callback) }
@@ -389,8 +407,74 @@ final class ActionExecutor {
             emit(request, outcome)
         }
     }
+    struct DirectoryUsageRequest {
+        fileprivate let receipt = ActionReceipt()
+        let actionID = UUID()
+        let url: URL
+        let sourceID: String
+        let identity: FileIdentity?
+        let query: String
+        let mode: SearchMode
+        let epoch: UInt64?
+    }
+    func captureDirectoryUsage(_ url: URL) -> DirectoryUsageRequest {
+        let source = sources().first { source in
+            let root = source.store.read { source.store.rootPath }
+            return source.isOnline && (root == "/" || url.path == root || url.path.hasPrefix(root + "/"))
+        }
+        return DirectoryUsageRequest(url: url, sourceID: source?.id ?? "startup", identity: system.identity(url),
+                                     query: directoryQuery?() ?? query(), mode: session.context.mode, epoch: usage?.epoch)
+    }
+    // Called only by a verified navigation result or clipboard API completion.
+    func completeDirectoryUsage(_ request: DirectoryUsageRequest, activity: UsageRecord.Activity) {
+        guard activity == .navigated || activity == .copied, request.receipt.claimUsage(), let identity = request.identity else { return }
+        usage?.record(actionID: request.actionID, epoch: request.epoch, type: .file, url: request.url,
+                      sourceID: request.sourceID, expected: identity, activity: activity, query: request.query, context: request.mode.rawValue)
+    }
+    private func activity(_ action: FileAction, outcome: ActionOutcome, mode: SearchMode) -> UsageRecord.Activity? {
+        if action == .contextNavigation || (action == .open && (mode == .open || mode == .save)) {
+            return outcome == .verified ? .navigated : nil
+        }
+        if action == .open && outcome == .accepted { return .initiated }
+        if action == .copyPath && outcome == .verified { return .copied }
+        return nil
+    }
+    private func recordUsage(_ request: ActionRequest, outcome: ActionOutcome, custom: Bool = false) {
+        guard let usage, let activity = custom ? (outcome == .accepted ? UsageRecord.Activity.initiated : nil)
+            : activity(request.action, outcome: outcome, mode: request.context.mode),
+              request.target.wasOnline, sources().contains(where: { $0.id == request.target.sourceID && $0.isOnline }),
+              request.receipt.claimUsage() else { return }
+        let url = activity == .navigated && !request.target.isDirectory ? request.target.url.deletingLastPathComponent() : request.target.url
+        let expected = activity == .navigated ? request.navigationIdentity : request.target.identity
+        if activity == .navigated && expected == nil { return }
+        usage.record(actionID: request.actionID, epoch: request.usageEpoch,
+                     type: request.target.isApplication && activity != .navigated ? .application : .file, url: url,
+                     sourceID: request.target.sourceID, expected: expected, activity: activity,
+                     query: request.query, context: request.context.mode.rawValue)
+    }
+    private func recordUsage(_ request: PaletteActionRequest, outcome: ActionOutcome, custom: Bool = false) {
+        guard let usage, let activity = custom ? (outcome == .accepted ? UsageRecord.Activity.initiated : nil)
+            : activity(request.action, outcome: outcome, mode: .ordinary), request.receipt.claimUsage() else { return }
+        switch request.item {
+        case .application(let app):
+            usage.record(actionID: request.actionID, epoch: request.usageEpoch, type: .application, url: app.url,
+                         sourceID: "startup", expected: request.identity, activity: activity, query: request.query, context: "application")
+        case .web(let web):
+            usage.record(actionID: request.actionID, epoch: request.usageEpoch, type: .web, url: nil,
+                         sourceID: "", keywordID: web.keyword.id, activity: activity, query: "", context: "web")
+        case .file: break
+        }
+    }
+    private func emitCustom(_ request: CustomActionRequest, _ outcome: ActionOutcome) {
+        if request.definition.recordsUsage {
+            if let file = request.file { recordUsage(file, outcome: outcome, custom: true) }
+            if let palette = request.palette { recordUsage(palette, outcome: outcome, custom: true) }
+        }
+        onCustomEvent?(CustomActionEvent(request: request, outcome: outcome))
+    }
     @discardableResult
     private func emit(_ request: ActionRequest, _ outcome: ActionOutcome) -> ActionOutcome {
+        recordUsage(request, outcome: outcome)
         onEvent?(ActionEvent(request: request, outcome: outcome)); return outcome
     }
 }

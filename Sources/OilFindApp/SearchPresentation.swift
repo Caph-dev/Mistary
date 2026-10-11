@@ -39,17 +39,60 @@ final class SearchPresentation {
     var total: Int { supplementedRows?.count ?? single?.total ?? multiple!.total }
     var sortedCount: Int { supplementedRows?.count ?? single?.sortedCount ?? multiple!.sortedCount }
     var elapsedMs: Double { single?.elapsedMs ?? multiple!.elapsedMs }
-    var count: Int { supplementedRows?.count ?? single?.items.count ?? multiple!.items.count }
+    enum RankingMode { case original, personalBounded }
+    struct RowKey: Hashable { let sourceID: String; let id: UInt32 }
+    private(set) var rankingMode: RankingMode = .original
+    private(set) var personalPrefixCount = 0
+    var usageRevision: UInt64 = 0
+    private var personalPositions: [Int] = []
+    private var excludedPositions: [Int] = []
+    private var inversePositions: [Int: Int] = [:]
+    private var recentRows: [(source: SearchSource, id: UInt32)] = []
+    private var recentKeys: Set<RowKey> = []
+    private var baseCount: Int { supplementedRows?.count ?? single?.items.count ?? multiple!.items.count }
+    var count: Int { baseCount + recentRows.count }
+    func baseRow(_ index: Int) -> (source: SearchSource, id: UInt32)? {
+        guard index >= 0, index < baseCount else { return nil }
+        if let supplementedRows { return supplementedRows[index] }
+        if let single { return (SearchSource(id: "startup", displayName: "", isOnline: true, store: single.store), single.items[index]) }
+        let hit = multiple!.items[index]
+        return (multiple!.sources[hit.sourceIndex], hit.entryID)
+    }
+    func applyPersonalPrefix(_ positions: [Int], recent: [(source: SearchSource, id: UInt32)] = [], order: [Int]? = nil) {
+        // Negative positions address recent rows outside the core's empty-query top 200.
+        personalPositions = order ?? positions
+        excludedPositions = positions.sorted()
+        inversePositions = Dictionary(uniqueKeysWithValues: personalPositions.enumerated().filter { $0.element >= 0 }.map { ($0.element, $0.offset) })
+        recentRows = recent
+        personalPrefixCount = personalPositions.count; rankingMode = .personalBounded
+    }
+    func markRecent(_ keys: Set<RowKey>) { recentKeys = keys }
+    func usageGroup(at index: Int) -> String? {
+        guard query.isEmpty, let row = row(index) else { return nil }
+        return recentKeys.contains(RowKey(sourceID: row.source.id, id: row.id)) ? "usage.recent" : "usage.modified"
+    }
+    private func displayedIndex(_ base: Int) -> Int {
+        if let personal = inversePositions[base] { return personal }
+        return personalPositions.count + base - excludedPositions.partitionIndex { $0 < base }
+    }
     var store: IndexStore { single?.store ?? multiple!.sources[0].store }
     var sources: [SearchSource] {
         single.map { [SearchSource(id: "startup", displayName: "", isOnline: true, store: $0.store)] } ?? multiple!.sources
     }
     func row(_ index: Int) -> (source: SearchSource, id: UInt32)? {
         guard index >= 0, index < count else { return nil }
-        if let supplementedRows { return supplementedRows[index] }
-        if let single { return (SearchSource(id: "startup", displayName: "", isOnline: true, store: single.store), single.items[index]) }
-        let hit = multiple!.items[index]
-        return (multiple!.sources[hit.sourceIndex], hit.entryID)
+        if index < personalPositions.count {
+            let value = personalPositions[index]
+            return value < 0 ? recentRows[-value - 1] : baseRow(value)
+        }
+        let ordinal = index - personalPositions.count
+        var low = ordinal, high = min(baseCount - 1, ordinal + excludedPositions.count)
+        while low < high {
+            let mid = (low + high) / 2
+            let excluded = excludedPositions.partitionIndex { $0 <= mid }
+            if mid + 1 - excluded >= ordinal + 1 { high = mid } else { low = mid + 1 }
+        }
+        return baseRow(low)
     }
     func detail(at index: Int) -> SupplementaryHit? {
         guard let row = row(index) else { return nil }; return details[row.source.id]?[row.id]
@@ -59,7 +102,7 @@ final class SearchPresentation {
         func mergeLocked(_ position: Int) -> SearchPresentation {
             if position < captured.count { return captured[position].store.read { mergeLocked(position + 1) } }
             let result = single.map(SearchPresentation.init) ?? SearchPresentation(multiple!)
-            var rows = (0..<count).compactMap { row($0) }
+            var rows = (0..<baseCount).compactMap { baseRow($0) }
             var seen = Dictionary(grouping: rows, by: { $0.source.id }).mapValues { Set($0.map(\.id)) }
             var extra: [(source: SearchSource, id: UInt32)] = []
             let allowed = Dictionary(uniqueKeysWithValues: captured.map { source in
@@ -91,6 +134,7 @@ final class SearchPresentation {
             extra.sort(by: better); rows.append(contentsOf: extra)
             if options.sort != .relevance { rows.sort(by: better) }
             result.launcherItems = launcherItems
+            result.usageRevision = usageRevision
             result.supplementedRows = rows; return result
         }
         return mergeLocked(0)
@@ -101,13 +145,16 @@ final class SearchPresentation {
         guard let source = sources.first(where: { $0.id == sourceID }) else { return nil }
         let resolved: UInt32? = source.store === store ? id : source.store.read { source.store.hashReady ? source.store.resolve(path: path) : nil }
         guard let resolved else { return nil }
-        if let supplementedRows { return supplementedRows.firstIndex { $0.source.id == sourceID && $0.id == resolved } }
-        if let single { return single.items.firstIndex(of: resolved) }
-        return multiple!.items.firstIndex { multiple!.sources[$0.sourceIndex].id == sourceID && $0.entryID == resolved }
+        if let recent = recentRows.firstIndex(where: { $0.source.id == sourceID && $0.id == resolved }) { return personalPositions.firstIndex(of: -recent - 1) }
+        let base: Int?
+        if let supplementedRows { base = supplementedRows.firstIndex { $0.source.id == sourceID && $0.id == resolved } }
+        else if let single { base = single.items.firstIndex(of: resolved) }
+        else { base = multiple!.items.firstIndex { multiple!.sources[$0.sourceIndex].id == sourceID && $0.entryID == resolved } }
+        return base.map(displayedIndex)
     }
     func sameRows(as other: SearchPresentation) -> Bool {
         guard launcherItems.map(\.identity) == other.launcherItems.map(\.identity) else { return false }
-        if supplementedRows == nil, other.supplementedRows == nil, let single, let rhs = other.single { return single.store === rhs.store && single.items == rhs.items }
+        if rankingMode == .original, other.rankingMode == .original, supplementedRows == nil, other.supplementedRows == nil, let single, let rhs = other.single { return single.store === rhs.store && single.items == rhs.items }
         guard count == other.count else { return false }
         for i in 0..<count {
             guard let a = row(i), let b = other.row(i), a.source.id == b.source.id, a.source.store === b.source.store, a.id == b.id else { return false }
@@ -115,6 +162,7 @@ final class SearchPresentation {
         return true
     }
     func sameMetadata(as other: SearchPresentation) -> Bool {
+        guard usageRevision == other.usageRevision, rankingMode == other.rankingMode, recentKeys == other.recentKeys else { return false }
         guard details.isEmpty && other.details.isEmpty && launcherItems.isEmpty && other.launcherItems.isEmpty else { return false }
         let a = sources, b = other.sources
         guard a.count == b.count else { return false }
@@ -129,5 +177,16 @@ final class SearchPresentation {
         return captured.indices.allSatisfy { i in
             captured[i].id == current[i].id && captured[i].store === current[i].store && captured[i].isOnline == current[i].isOnline && captured[i].displayName == current[i].displayName && current[i].store.read { current[i].store.version == versions[i] }
         }
+    }
+}
+
+private extension Array where Element == Int {
+    func partitionIndex(_ predicate: (Int) -> Bool) -> Int {
+        var low = 0, high = count
+        while low < high {
+            let mid = (low + high) / 2
+            if predicate(self[mid]) { low = mid + 1 } else { high = mid }
+        }
+        return low
     }
 }

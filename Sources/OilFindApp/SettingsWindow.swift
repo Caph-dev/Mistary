@@ -12,6 +12,7 @@ final class SettingsModel: ObservableObject {
     let launcher: LauncherPreferences
     let customActions: ActionDefinitions
     let savedFilters: SavedFiltersStore
+    let usage: UsageStore
     private var languageObserver: NSObjectProtocol?
     private let languageDefaults: UserDefaults
     private var coverageExplanation: CoverageExplanation?
@@ -53,6 +54,7 @@ final class SettingsModel: ObservableObject {
         self.favorites = snapshot ? FavoritesStore(url: nil) : .shared
         self.launcher = snapshot ? LauncherPreferences(url: nil) : .shared
         self.customActions = snapshot ? ActionDefinitions(url: nil) : .shared
+        self.usage = snapshot ? UsageStore(url: nil) : .shared
         self.savedFilters = snapshot ? SavedFiltersStore(url: nil) : .shared
         self.languageDefaults = languageDefaults
         self.language = L10n.language
@@ -366,6 +368,32 @@ private struct LauncherKeywordRow: View {
     }
 }
 
+private struct UsageSettingsSection: View {
+    @ObservedObject var store: UsageStore
+    @State private var failed = false
+    var body: some View {
+        Section(L10n.text("usage.settings")) {
+            Toggle(L10n.text("usage.enabled"), isOn: Binding(get: { store.enabled }, set: { value in
+                do { try store.setEnabled(value); failed = false } catch { failed = true }
+            }))
+            Text(L10n.text("usage.privacy")).font(.footnote).foregroundStyle(.secondary)
+            Button(L10n.text("usage.clear")) {
+                do { try store.clear(); failed = false } catch { failed = true }
+            }
+            ForEach(store.records.prefix(10)) { record in
+                if let identity = record.identity {
+                    let resolved = store.system.resolve(identity)
+                    Text(resolved.0.lastPathComponent + " · " + L10n.text("usage." + record.activity.rawValue) + " · " + L10n.text("directory." + resolved.1.rawValue))
+                        .font(.footnote).foregroundStyle(.secondary).help(resolved.0.path)
+                } else if let keyword = record.keywordID {
+                    Text(keyword + " · " + L10n.text("usage.initiated")).font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            if failed || store.error != nil { Text(L10n.text("usage.error")).foregroundStyle(.red) }
+        }
+    }
+}
+
 private struct CustomActionsSettingsSection: View {
     @ObservedObject var store: ActionDefinitions
     @State private var draft = ""
@@ -575,7 +603,8 @@ private struct SettingsForm: View {
                 scopeRow("system", key: "indexSystemDirs", enabled: model.indexSystemDirs)
             } header: { Text(L10n.text("settings.scope")) }
               footer: { hint(L10n.text("settings.scopeHint")) }
-            FavoriteSettingsSection(store: model.favorites, window: window)
+            UsageSettingsSection(store: model.usage)
+        FavoriteSettingsSection(store: model.favorites, window: window)
             LauncherSettingsSection(store: model.launcher, window: window)
             CustomActionsSettingsSection(store: model.customActions)
             SavedFiltersSettingsSection(store: model.savedFilters)

@@ -14,6 +14,7 @@ struct ApplicationPaletteItem {
     let name: String
     let bundleIdentifier: String?
     let available: Bool
+    var usageGroup: String? = nil
 }
 
 /// File rows retain their presentation, including source and supplementary details.

@@ -49,13 +49,12 @@ struct ActionDefinition: Codable, Equatable, Identifiable {
     var permissions: [ActionPermission]
     var enabled: Bool
     var execution: ActionExecution
-    // Custom actions emit events but do not feed usage ranking until plan 008.
+    // Opt-in records process launch acceptance; exit results remain separate.
     var recordsUsage: Bool = false
     var isValid: Bool {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, name.count <= 256,
               !itemTypes.isEmpty, Set(itemTypes).count == itemTypes.count,
-              !modes.isEmpty, modes.allSatisfy({ SearchMode(rawValue: $0) != nil }),
-              !recordsUsage else { return false }
+              !modes.isEmpty, modes.allSatisfy({ SearchMode(rawValue: $0) != nil }) else { return false }
         let binding = ActionBinding(type: .file, url: URL(fileURLWithPath: "/tmp/test"), name: "test", directory: URL(fileURLWithPath: "/tmp"))
         func validTemplate(_ value: String) -> Bool {
             !value.utf8.contains(0) && value.count <= 16_384 && (try? binding.substitute(value)) != nil

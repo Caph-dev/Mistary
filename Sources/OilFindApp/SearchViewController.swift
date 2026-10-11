@@ -24,6 +24,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     let launcher: LauncherPreferences
     let customActions: ActionDefinitions
     let savedFilters: SavedFiltersStore
+    let usage: UsageStore
+    private var usageObserver: AnyCancellable?
     private var activatedPinyin: Bool?
     private var launcherObserver: AnyCancellable?
     private let modeButton = NSButton(title: "", target: nil, action: nil)
@@ -58,6 +60,9 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             guard let self else { return [] }
             return self.snapshot ? self.snapshotSources : self.searchSources
         })
+        executor.usage = usage
+        executor.query = { [weak self] in self?.results.result?.query.raw ?? self?.searchField.text ?? "" }
+        executor.directoryQuery = { [weak self] in Query.normalizePaste(self?.searchField.text ?? "") }
         executor.dialog.onUpdate = { [weak self] in self?.updateDialogControls() }
         executor.onEvent = { [weak self] event in
             self?.actionDidFinish(event); self?.onActionEvent?(event)
@@ -135,12 +140,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     var hidePanel: (() -> Void)?
     var onSettings: (() -> Void)?
-    init(snapshot: Bool, favorites: FavoritesStore? = nil, launcher: LauncherPreferences? = nil, customActions: ActionDefinitions? = nil, savedFilters: SavedFiltersStore? = nil, searchQueue: DispatchQueue? = nil) {
+    init(snapshot: Bool, favorites: FavoritesStore? = nil, launcher: LauncherPreferences? = nil, customActions: ActionDefinitions? = nil, savedFilters: SavedFiltersStore? = nil, usage: UsageStore? = nil, searchQueue: DispatchQueue? = nil) {
         self.snapshot = snapshot
         self.queue = searchQueue ?? DispatchQueue(label: "com.oiloil.find.search", qos: .userInteractive)
         self.launcher = launcher ?? (snapshot ? LauncherPreferences(url: nil) : .shared)
         self.customActions = customActions ?? (snapshot ? ActionDefinitions(url: nil) : .shared)
         self.savedFilters = savedFilters ?? (snapshot ? SavedFiltersStore(url: nil) : .shared)
+        self.usage = usage ?? (snapshot ? UsageStore(url: nil) : .shared)
         self.favorites = favorites ?? (snapshot ? FavoritesStore(url: nil) : .shared)
         super.init(nibName: nil, bundle: nil)
     }
@@ -161,6 +167,15 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         fileSearchButton.target = self; fileSearchButton.action = #selector(forceFileSearch)
         routeHint.font = .systemFont(ofSize: 11); routeHint.textColor = .secondaryLabelColor
         routeHint.lineBreakMode = .byTruncatingMiddle
+        usageObserver = usage.objectWillChange.sink { [weak self] _ in
+            guard let self else { return }
+            // Immediately reject workers holding the old usage snapshot.
+            _ = self.generation.next()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.startSearch(preserveSelection: true)
+            }
+        }
         launcherObserver = launcher.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }; self.session.invalidateActions()
@@ -321,7 +336,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         if case .files = routeInput() {} else { startSearch(preserveSelection: true); return }
         let currentQuery = Query.parse(searchField.text, store: manager?.store)
         let requestedOptions = effectiveOptions
-        if let result = results.result, result.isCurrent(searchSources), launcher.aliases.isEmpty, result.launcherItems.isEmpty,
+        if let result = results.result, result.usageRevision == usage.revision, result.isCurrent(searchSources), launcher.aliases.isEmpty, result.launcherItems.isEmpty,
            let options = result.single?.options ?? result.multiple?.results.first?.options,
            options.kind == requestedOptions.kind, options.sort == requestedOptions.sort,
            options.ascending == requestedOptions.ascending, options.pinyin == requestedOptions.pinyin,
@@ -390,6 +405,11 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
         let options = effectiveOptions
         let query = editingQuery(store: store), previous = results.result
+        let usageRevision = usage.revision, history = usage.enabled ? usage.records : []
+        let historySystem = usage.system, context = session.context.mode.rawValue
+        let allowsRecentApplications = forcedFileInput == nil && query.isEmpty && options.sort == .relevance && options.directoryScope == nil
+            && (session.context.mode == .ordinary || session.context.mode == .application) && (options.kind == nil || options.kind == 2)
+        let favoriteEntries = favorites.favorites, favoriteSystem = favorites.system
         updateDirectoryControls()
         let cancelled = { [generation] in !generation.current(token) }
         let supplementary = supplementaryProvider?.prepareSearch(query, options: options, sources: sources, isCancelled: cancelled)
@@ -423,13 +443,29 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                 guard let result = MultiSearcher.search(query, options: options, in: sources, previous: previous?.multiple, caches: self.sourceCaches, isCancelled: { !self.generation.current(token) }), self.generation.current(token) else { return }
                 found = SearchPresentation(result)
             }
-            found.addAliases(aliases)
+            let resolved = options.sort == .relevance ? UsageStore.resolve(history, system: historySystem, sources: sources, cancelled: cancelled) : []
+            let favoriteURLs: [URL] = options.sort == .relevance && !query.isEmpty ? favoriteEntries.prefix(UsageStore.candidateLimit).compactMap { entry in
+                guard !cancelled() else { return nil }
+                let url = entry.bookmark.flatMap { try? favoriteSystem.resolve($0) } ?? URL(fileURLWithPath: entry.fallbackPath)
+                return favoriteSystem.check(url) == .available ? url : nil
+            } : []
+            found.usageRevision = usageRevision
+            UsageRanker.rank(found, history: resolved, favorites: favoriteURLs, options: options, context: context, cancelled: cancelled)
+            let recentApplications: [PaletteItem] = allowsRecentApplications ? resolved.filter {
+                $0.record.type == .application && $0.record.launches > 0 && $0.availability == .available
+            }.map { value in
+                .application(ApplicationPaletteItem(url: value.url, name: value.url.deletingPathExtension().lastPathComponent,
+                    bundleIdentifier: nil, available: true, usageGroup: "usage.recent"))
+            } : []
+            var launcherIDs: Set<String> = []
+            found.addAliases((recentApplications + aliases).filter { launcherIDs.insert($0.identity).inserted })
             let anchoredRow = anchor.flatMap { found.index(sourceID: $0.sourceID, store: $0.store, id: $0.id, path: $0.path) }
             let row = anchoredRow.map { $0 + found.launcherItems.count }
                 ?? paletteAnchor.flatMap { id in found.launcherItems.firstIndex { $0.identity == id } } ?? 0
             let deferNames = anchor != nil && anchoredRow == nil && supplementary != nil && previous?.query.raw == query.raw
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation.current(token), self.session.isCurrent(sessionToken) else { return }
+                guard let self, self.usage.revision == usageRevision, self.generation.current(token), self.session.isCurrent(sessionToken),
+                      found.isCurrent(self.snapshot ? self.snapshotSources : self.searchSources) else { return }
                 self.diagnostics = query.diagnostics
                 if deferNames { return }
                 if refresh {
@@ -444,8 +480,12 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                     guard let self, self.generation.current(token) else { return }
                     if box.hits.isEmpty && !deferNames { return }
                     let combined = box.hits.isEmpty ? found : found.supplement(box.hits, options: options)
+                    if combined !== found {
+                        combined.usageRevision = usageRevision
+                        UsageRanker.rank(combined, history: resolved, favorites: favoriteURLs, options: options, context: context, cancelled: cancelled)
+                    }
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.generation.current(token), self.session.isCurrent(sessionToken), combined.isCurrent(self.snapshot ? self.snapshotSources : self.searchSources) else { return }
+                        guard let self, self.usage.revision == usageRevision, self.generation.current(token), self.session.isCurrent(sessionToken), combined.isCurrent(self.snapshot ? self.snapshotSources : self.searchSources) else { return }
                         self.pendingNewSearch = nil
                         self.results.refresh(combined)
                     }
@@ -498,8 +538,9 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         footer.warning = !diagnostics.isEmpty
         if let diagnostic = diagnostics.first { footer.text = L10n.diagnostic(diagnostic); return }
         if result.query.isEmpty {
-            let count = Presentation.countText(result.sources.reduce(0) { count, source in count + source.store.read { source.store.liveCount } })
-            footer.text = L10n.text("footer.recent", count)
+            footer.text = L10n.text("usage.emptyFooter")
+        } else if result.rankingMode == .personalBounded {
+            footer.text = L10n.text("usage.footer", Presentation.countText(result.personalPrefixCount), Presentation.countText(result.single?.total ?? result.multiple!.total))
         } else {
             footer.text = L10n.text(result.sortedCount < result.total ? "footer.partial" : "footer.results", Presentation.countText(result.total + result.launcherItems.count), Presentation.elapsedText(result.elapsedMs))
         }
@@ -850,7 +891,11 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     @objc func copyDialogPath() {
         let adapter = actionExecutor.dialog
         guard !adapter.isNavigating, let path = adapter.path, let token = adapter.token, session.isCurrent(token) else { return }
-        if actionExecutor.system.copy(.copyPath, path, path.lastPathComponent) { footer.showToast(.copiedPath, value: path.path) }
+        let request = actionExecutor.captureDirectoryUsage(path)
+        if actionExecutor.system.copy(.copyPath, path, path.lastPathComponent) {
+            actionExecutor.completeDirectoryUsage(request, activity: .copied)
+            footer.showToast(.copiedPath, value: path.path)
+        }
         else { footer.showMessage("action.clipboardRejected", snapshot: snapshot) }
     }
     @objc private func exitDialogMode() { setSearchMode(.ordinary); searchField.focus() }
@@ -863,12 +908,16 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
               candidate.finderDirectory.map({ Date().timeIntervalSince($0.observedAt) >= 0 && Date().timeIntervalSince($0.observedAt) <= 120 && session.context.finderDirectoryIsCurrent?() == true }) ?? true else {
             footer.showMessage("dialog.staleDirectory", snapshot: snapshot); return
         }
+        let request = actionExecutor.captureDirectoryUsage(candidate.url)
         let adapter = actionExecutor.dialog
         let outcome = adapter.navigate(directory: candidate.url, file: nil, context: session.context.dialog,
                                        token: token, host: session.context.target, isCurrent: { [weak self] in self?.session.isCurrent(token) == true }) { [weak self] outcome in
             guard let self, self.session.isCurrent(token) else { return }
             self.updateDialogControls()
-            if outcome == .verified { self.session.end() }
+            if outcome == .verified {
+                self.actionExecutor.completeDirectoryUsage(request, activity: .navigated)
+                self.session.end()
+            }
             else { (self.view.window as? SearchPanel)?.resumeDialog() }
         }
         if outcome == .accepted { (view.window as? SearchPanel)?.hide(endingSession: false) }
