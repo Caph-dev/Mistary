@@ -16,6 +16,8 @@ struct SearchContext {
     var finderDirectory: FinderDirectory? = nil
     var finderUnavailable: FinderUnavailable? = nil
     var recentFinderDirectory: FinderDirectory? = nil
+    var dialog: DialogContext? = nil
+    var finderDirectoryIsCurrent: (() -> Bool)? = nil
     static let ordinary = SearchContext(mode: .ordinary, target: nil, directoryScope: nil)
 }
 
@@ -34,9 +36,11 @@ final class SearchSession {
     private(set) var context = SearchContext.ordinary
     private(set) var isActive = true
     private(set) var directoryScope: URL? = nil
+    var onInvalidate: (() -> Void)?
     var token: SearchSessionToken { SearchSessionToken(sessionID: sessionID, queryGeneration: queryGeneration, actionGeneration: actionGeneration) }
 
     func begin(source: PanelSource, context: SearchContext) {
+        onInvalidate?()
         sessionID = UUID(); queryGeneration = 0; actionGeneration = 0
         invocationSource = source; self.context = context; directoryScope = nil; isActive = true
     }
@@ -46,11 +50,13 @@ final class SearchSession {
     func setMode(_ mode: SearchMode) {
         context = SearchContext(mode: mode, target: context.target, directoryScope: context.directoryScope,
                                 finderDirectory: context.finderDirectory, finderUnavailable: context.finderUnavailable,
-                                recentFinderDirectory: context.recentFinderDirectory)
+                                recentFinderDirectory: context.recentFinderDirectory,
+                                dialog: context.dialog.flatMap { ($0.mode == .open && mode == .open) || ($0.mode == .save && mode == .save) ? $0 : nil },
+                                finderDirectoryIsCurrent: context.finderDirectoryIsCurrent)
         queryChanged()
     }
     func queryChanged() { queryGeneration &+= 1; invalidateActions() }
-    func invalidateActions() { actionGeneration &+= 1 }
+    func invalidateActions() { actionGeneration &+= 1; onInvalidate?() }
     func end() { isActive = false; invalidateActions() }
     func isCurrent(_ token: SearchSessionToken) -> Bool { isActive && self.token == token }
     /// Future directory resolvers must submit against the context they captured.

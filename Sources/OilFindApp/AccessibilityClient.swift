@@ -376,3 +376,81 @@ final class SystemAccessibilityClient: DialogAccessibilityClient {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &directory) && directory.boolValue
     }
 }
+
+/// Read-only, opt-in recognition. Button labels are hints for manual mode only.
+/// A total deadline and traversal limits bound each queued observation.
+final class SystemDialogRecognition {
+    private let queue = DispatchQueue(label: "me.caph.mistary.dialog-recognition", qos: .userInitiated)
+    private let trusted: () -> Bool
+    private let frontmostPID: () -> Int32?
+    private let readAttribute: (AXUIElement, String, DialogCallContext) throws -> CFTypeRef?
+    init(trusted: @escaping () -> Bool = { AXIsProcessTrusted() },
+         frontmostPID: @escaping () -> Int32? = { NSWorkspace.shared.frontmostApplication?.processIdentifier },
+         readAttribute: @escaping (AXUIElement, String, DialogCallContext) throws -> CFTypeRef? = { element, name, context in
+             guard AXUIElementSetMessagingTimeout(element, Float(min(0.08, context.remaining))) == .success else { throw DialogFailure.systemError }
+             var value: CFTypeRef?
+             let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+             if error == .attributeUnsupported || error == .noValue { return nil }
+             guard error == .success else { throw DialogFailure.systemError }
+             return value
+         }) {
+        self.trusted = trusted; self.frontmostPID = frontmostPID; self.readAttribute = readAttribute
+    }
+    func capture(processID: Int32, completion: @escaping (DialogMode?) -> Void) {
+        guard trusted() else { completion(nil); return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.6
+        // Delivery and the watchdog share the main queue; late IPC cannot deliver twice.
+        var delivered = false
+        func deliver(_ mode: DialogMode?) {
+            guard !delivered else { return }; delivered = true; completion(mode)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { deliver(nil) }
+        queue.async {
+            let context = DialogCallContext(deadline: deadline, now: { ProcessInfo.processInfo.systemUptime }) {
+                self.trusted() ? nil : .permissionRevoked
+            }
+            let mode = try? self.inspect(processID: processID, context: context)
+            DispatchQueue.main.async { deliver(mode ?? nil) }
+        }
+    }
+    private func inspect(processID: Int32, context: DialogCallContext) throws -> DialogMode? {
+        func read(_ element: AXUIElement, _ name: String) throws -> CFTypeRef? {
+            try context.check()
+            guard frontmostPID() == processID else { throw DialogFailure.unexpectedFocus }
+            let value = try readAttribute(element, name, context)
+            try context.check()
+            return value
+        }
+        let app = AXUIElementCreateApplication(processID)
+        guard let value = try read(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        let window = unsafeBitCast(value, to: AXUIElement.self)
+        struct Evidence { var browser = false; var modes = Set<String>() }
+        var nodes: [(AXUIElement, Int, Int?)] = [(window, 0, nil)]
+        var visited = 0, containers: [Int: Evidence] = [:]
+        while let (element, depth, parentContainer) = nodes.popLast() {
+            visited += 1
+            guard visited <= 120, depth <= 10 else { return nil }
+            let role = try read(element, kAXRoleAttribute) as? String
+            let subrole = try read(element, kAXSubroleAttribute) as? String
+            let startsContainer = role == kAXSheetRole || subrole == kAXDialogSubrole
+            let container: Int? = startsContainer ? visited : parentContainer
+            if startsContainer { containers[visited] = Evidence() }
+            if let container {
+                if role == kAXBrowserRole { containers[container]?.browser = true }
+                if role == kAXButtonRole, let title = try read(element, kAXTitleAttribute) as? String {
+                    if ["Open", "打开", "開啟"].contains(title) { containers[container]?.modes.insert(DialogMode.open.rawValue) }
+                    if ["Save", "存储", "保存", "儲存"].contains(title) { containers[container]?.modes.insert(DialogMode.save.rawValue) }
+                }
+            }
+            if let children = try read(element, kAXChildrenAttribute) as? [AXUIElement] {
+                guard nodes.count + children.count + visited <= 120 else { return nil }
+                nodes.append(contentsOf: children.map { ($0, depth + 1, container) })
+            }
+        }
+        // Bind the result to the same focused window after traversal.
+        let matches = containers.values.filter { $0.browser && $0.modes.count == 1 }
+        guard matches.count == 1, let name = matches.first?.modes.first,
+              let current = try read(app, kAXFocusedWindowAttribute), CFEqual(current, window) else { return nil }
+        return DialogMode(rawValue: name)
+    }
+}

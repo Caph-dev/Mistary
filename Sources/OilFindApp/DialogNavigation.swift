@@ -90,17 +90,20 @@ final class DialogNavigation {
     private var workerBusy = false
 
     private final class Session {
-        let generation = UUID()
+        let generation: UUID
         var state = DialogState.captured
         var history: [DialogState] = []
         var target: DialogTarget?
         var step = UUID()
         var deadline: TimeInterval = 0
         var dispatchedWrite = false
+        var validatePath: () -> DialogFailure? = { nil }
         var selection = false
         var selectionFailure: DialogFailure?
         let completion: (DialogNavigationResult) -> Void
-        init(completion: @escaping (DialogNavigationResult) -> Void) { self.completion = completion }
+        init(generation: UUID, completion: @escaping (DialogNavigationResult) -> Void) {
+            self.generation = generation; self.completion = completion
+        }
     }
 
     init(client: DialogAccessibilityClient, permissions: AccessibilityPermissionChecking,
@@ -112,7 +115,8 @@ final class DialogNavigation {
     }
 
     /// Completion is delivered once on the main queue; IPC never runs there.
-    func start(directory: URL, file: URL? = nil, mode: DialogMode,
+    func start(directory: URL, file: URL? = nil, mode: DialogMode, target capturedTarget: DialogTarget? = nil,
+               validatePath: @escaping () -> DialogFailure? = { nil },
                completion: @escaping (DialogNavigationResult) -> Void) {
         lock.lock()
         guard !workerBusy else {
@@ -123,7 +127,8 @@ final class DialogNavigation {
             }
             return
         }
-        let session = Session(completion: completion)
+        let session = Session(generation: capturedTarget?.generation ?? UUID(), completion: completion)
+        session.validatePath = validatePath
         active = session; workerBusy = true
         lock.unlock()
         worker.async { [self] in
@@ -141,7 +146,9 @@ final class DialogNavigation {
                         throw DialogFailure.invalidControl
                     }
                 }
-                let target = try call(session) { try client.capture(mode: mode, generation: session.generation, context: $0) }
+                let target: DialogTarget
+                if let capturedTarget { target = capturedTarget }
+                else { target = try call(session) { try client.capture(mode: mode, generation: session.generation, context: $0) } }
                 guard target.generation == session.generation, target.mode == mode else { throw DialogFailure.targetReplaced }
                 lock.lock(); session.target = target; lock.unlock()
                 try transition(.captured, session)
@@ -224,7 +231,8 @@ final class DialogNavigation {
         let context = DialogCallContext(deadline: deadline, now: now) { [self] in
             lock.lock(); let terminal = session.state.terminal || active !== session; lock.unlock()
             if terminal { return .cancelled }
-            return permissions.isTrusted() ? nil : .permissionRevoked
+            if !permissions.isTrusted() { return .permissionRevoked }
+            return session.validatePath()
         }
         try context.check()
         let value = try body(context)

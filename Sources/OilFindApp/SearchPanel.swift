@@ -75,6 +75,7 @@ final class SearchPanel: NSPanel {
     let searchController: SearchViewController
     private(set) var hiding = false
     private var animationGeneration = 0
+    private var presentationGeneration = UUID()
     private var fade: WindowFade?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -97,11 +98,24 @@ final class SearchPanel: NSPanel {
         if isVisible && isKeyWindow && !hiding { hide(source: source) } else { show(source: source) }
     }
     func show(source: PanelSource = .interaction, captureContext: Bool = true) {
-        let cold = !isVisible
-        if cold || hiding || !searchController.session.isActive {
-            let context = captureContext && source.capturesExternalContext ? contextResolver.capture(source: source) : .ordinary
-            searchController.beginSession(source: source, context: context)
+        let presentation = UUID(); presentationGeneration = presentation
+        if !isVisible || hiding || !searchController.session.isActive {
+            searchController.endSession()
+            if captureContext && source.capturesExternalContext {
+                contextResolver.capture(source: source) { [weak self] context in
+                    guard let self, self.presentationGeneration == presentation else { return }
+                    self.searchController.beginSession(source: source, context: context)
+                    self.present(source: source)
+                }
+                return
+            }
+            searchController.beginSession(source: source, context: .ordinary)
         }
+        present(source: source)
+    }
+    func resumeDialog() { if searchController.session.isActive { present(source: .interaction) } }
+    private func present(source: PanelSource) {
+        let cold = !isVisible
         if cold {
             let mouse = NSEvent.mouseLocation
             guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main else { return }
@@ -126,6 +140,7 @@ final class SearchPanel: NSPanel {
         fade?.start()
     }
     func hide(source: PanelSource = .interaction, endingSession: Bool = true) {
+        presentationGeneration = UUID()
         if endingSession { searchController.endSession() }
         guard isVisible, !hiding else { return }
         AppLog.logger.info("panel hide source=\(source.rawValue, privacy: .public)")

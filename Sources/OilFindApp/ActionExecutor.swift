@@ -11,7 +11,7 @@ enum FileAction: String, CaseIterable {
 enum ActionFailure: String, Error {
     case staleSession, sourceUnavailable, storeReplaced, targetChanged, fileUnavailable
     case systemRejected, clipboardRejected, trashNotVerified, contextUnavailable, alreadyDispatched, superseded
-    case applicationUnavailable, invalidURL, unsupportedAction
+    case applicationUnavailable, invalidURL, unsupportedAction, dialogManual, dialogFailed
 }
 
 enum ActionOutcome: Equatable {
@@ -60,6 +60,7 @@ struct FileTargetSnapshot {
     let url: URL
     let name: String
     let identity: FileIdentity?
+    let isDirectory: Bool
 }
 
 fileprivate final class ActionReceipt {
@@ -75,6 +76,7 @@ struct ActionRequest {
     let token: SearchSessionToken
     let action: FileAction
     let target: FileTargetSnapshot
+    let context: SearchContext
 }
 
 struct PaletteActionRequest {
@@ -135,10 +137,12 @@ final class ActionExecutor {
     var sources: () -> [SearchSource]
     var onEvent: ((ActionEvent) -> Void)?
     var onPaletteEvent: ((PaletteActionEvent) -> Void)?
+    var dialog = DialogAdapter()
     private var trashing: Set<URL> = []
 
     init(session: SearchSession, system: ActionSystem = ActionSystem(), sources: @escaping () -> [SearchSource]) {
         self.session = session; self.system = system; self.sources = sources
+        session.onInvalidate = { [weak self] in self?.dialog.cancel() }
     }
     func capture(_ action: FileAction, paletteItem: PaletteItem) -> PaletteActionRequest? {
         guard paletteItem.actions.contains(action) else { return nil }
@@ -212,11 +216,12 @@ final class ActionExecutor {
         return ActionRequest(actionID: UUID(), token: session.token, action: action,
                              target: FileTargetSnapshot(sourceID: item.source.id, sourceName: item.source.displayName,
                                                         wasOnline: item.source.isOnline, store: store, storeVersion: version,
-                                                        entryID: item.id, url: url, name: item.name, identity: identity))
+                                                        entryID: item.id, url: url, name: item.name, identity: identity, isDirectory: item.kind == 1),
+                             context: session.context)
     }
     func validate(_ request: ActionRequest) -> ActionFailure? {
         guard session.isCurrent(request.token) else { return .staleSession }
-        guard request.action != .contextNavigation else { return .contextUnavailable }
+        if request.action == .contextNavigation && request.context.mode != .open && request.context.mode != .save { return .contextUnavailable }
         let target = request.target
         guard let source = sources().first(where: { $0.id == target.sourceID }) else { return .sourceUnavailable }
         guard source.store === target.store else { return .storeReplaced }
@@ -242,6 +247,23 @@ final class ActionExecutor {
         guard request.receipt.consume() else { return .cancelled(.alreadyDispatched) }
         if let failure = validate(request) { return emit(request, .cancelled(failure)) }
         let target = request.target
+        if request.action == .contextNavigation || (request.action == .open && (request.context.mode == .open || request.context.mode == .save)) {
+            if let dialogContext = request.context.dialog, let original = dialogContext.target {
+                guard let host = request.context.target, host.processID == original.hostPID,
+                      host.windowIdentity == original.windowIdentity,
+                      host.bundleIdentifier == dialogContext.capability?.bundleIdentifier else { return emit(request, .cancelled(.targetChanged)) }
+            }
+            let directory = target.isDirectory ? target.url : target.url.deletingLastPathComponent()
+            let file = request.context.mode == .open && !target.isDirectory ? target.url : nil
+            let outcome = dialog.navigate(directory: directory, file: file, context: request.context.dialog,
+                                          token: request.token, host: request.context.target,
+                                          validateOriginalFile: { FileIdentity.read(target.url) == target.identity ? nil : .invalidControl },
+                                          isCurrent: { [weak self] in self?.session.isCurrent(request.token) == true }) { [weak self] outcome in
+                guard let self, self.session.isCurrent(request.token) else { return }
+                self.emit(request, outcome)
+            }
+            return emit(request, outcome)
+        }
         switch request.action {
         case .open: return emit(request, system.open(target.url) ? .accepted : .failed(.systemRejected))
         case .reveal: return emit(request, system.reveal(target.url) ? .accepted : .failed(.systemRejected))

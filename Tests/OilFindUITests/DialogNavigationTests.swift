@@ -351,4 +351,33 @@ final class DialogNavigationTests: XCTestCase {
         XCTAssertThrowsError(try Application.validateArguments(["--ax-probe", "permissions"]))
     }
     #endif
+    func testCapturedTargetIsValidatedWithoutRecapturingFrontmost() {
+        let client = Client(), permission = Permission()
+        let target = DialogTarget(hostPID: 10, accessibilityPID: 10, windowIdentity: UUID(), panelIdentity: UUID(), mode: .save, generation: UUID())
+        client.target = target
+        let navigator = DialogNavigation(client: client, permissions: permission)
+        let done = expectation(description: "captured target")
+        navigator.start(directory: URL(fileURLWithPath: "/tmp/new"), mode: .save, target: target) { result in
+            XCTAssertEqual(result.state, .verified)
+            XCTAssertEqual(result.target?.panelIdentity, target.panelIdentity)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 3); drain(navigator)
+        XCTAssertFalse(client.calls.contains("capture"))
+        XCTAssertEqual(client.filename, "keep 文档.txt")
+    }
+    func testPathInvalidationStopsBeforeAnySubsequentWrite() {
+        let client = Client(), permission = Permission()
+        let navigator = DialogNavigation(client: client, permissions: permission)
+        let done = expectation(description: "path invalidated")
+        var valid = true
+        client.onCall = { name in if name == "pathControl" { valid = false } }
+        navigator.start(directory: URL(fileURLWithPath: "/tmp/new"), mode: .open, validatePath: { valid ? nil : .invalidControl }) { result in
+            XCTAssertEqual(result.state, .failed(.invalidControl)); done.fulfill()
+        }
+        wait(for: [done], timeout: 3); drain(navigator)
+        XCTAssertFalse(client.calls.contains("writeDirectory"))
+        XCTAssertFalse(client.calls.contains("confirmDirectory"))
+    }
+
 }

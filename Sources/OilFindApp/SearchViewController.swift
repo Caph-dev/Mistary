@@ -26,6 +26,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private let modeButton = NSButton(title: "", target: nil, action: nil)
     private let fileSearchButton = NSButton(title: "", target: nil, action: nil)
     private let routeHint = NSTextField(labelWithString: "")
+    let dialogHint = NSTextField(labelWithString: "")
+    let dialogPath = NSTextField(labelWithString: "")
+    let dialogCopyButton = NSButton(title: "", target: nil, action: nil)
+    private let dialogOrdinaryButton = NSButton(title: "", target: nil, action: nil)
     private var capturedMode: SearchMode = .ordinary
     private var forcedFileInput: String?
     private(set) var queryRoute: QueryRoute = .files("")
@@ -51,6 +55,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             guard let self else { return [] }
             return self.snapshot ? self.snapshotSources : self.searchSources
         })
+        executor.dialog.onUpdate = { [weak self] in self?.updateDialogControls() }
         executor.onEvent = { [weak self] event in
             self?.actionDidFinish(event); self?.onActionEvent?(event)
         }
@@ -129,7 +134,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     override func loadView() { view = PanelSurface(snapshot: snapshot) }
     override func viewDidLoad() {
         super.viewDidLoad()
-        [searchField, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, modeButton, fileSearchButton, routeHint, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        [searchField, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, modeButton, fileSearchButton, routeHint, dialogHint, dialogPath, dialogCopyButton, dialogOrdinaryButton, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        dialogHint.font = .systemFont(ofSize: 11); dialogHint.textColor = .secondaryLabelColor
+        dialogHint.lineBreakMode = .byWordWrapping; dialogHint.maximumNumberOfLines = 2
+        dialogPath.font = .systemFont(ofSize: 11); dialogPath.lineBreakMode = .byTruncatingMiddle
+        dialogCopyButton.target = self; dialogCopyButton.action = #selector(copyDialogPath)
+        dialogOrdinaryButton.target = self; dialogOrdinaryButton.action = #selector(exitDialogMode)
+        for button in [dialogCopyButton, dialogOrdinaryButton] { button.bezelStyle = .rounded; button.controlSize = .small }
         modeButton.bezelStyle = .rounded; modeButton.controlSize = .small
         modeButton.target = self; modeButton.action = #selector(showModes)
         fileSearchButton.bezelStyle = .rounded; fileSearchButton.controlSize = .small
@@ -237,8 +248,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         modeButton.frame = NSRect(x: 18, y: 140 + px, width: 120, height: 24)
         fileSearchButton.frame = NSRect(x: 146, y: 140 + px, width: 180, height: 24)
         routeHint.frame = NSRect(x: 336, y: 145 + px, width: max(0, w - 354), height: 18)
-        favoriteRows.frame = NSRect(x: 22, y: 172 + px, width: w - 44, height: favoriteHeight)
-        let top: CGFloat = 172 + px + favoriteHeight
+        let dialogHeight: CGFloat = dialogHint.isHidden ? 0 : 82
+        dialogHint.frame = NSRect(x: 18, y: 172 + px, width: w - 36, height: 34)
+        dialogPath.frame = NSRect(x: 18, y: 210 + px, width: max(0, w - 264), height: 18)
+        dialogCopyButton.frame = NSRect(x: w - 238, y: 207 + px, width: 100, height: 24)
+        dialogOrdinaryButton.frame = NSRect(x: w - 132, y: 207 + px, width: 114, height: 24)
+        favoriteRows.frame = NSRect(x: 22, y: 172 + px + dialogHeight, width: w - 44, height: favoriteHeight)
+        let top: CGFloat = 172 + px + favoriteHeight + dialogHeight
         let region = NSRect(x: 0, y: top, width: w, height: max(0, h - top - 34 - px))
         [results, empty, indexing, syntax].forEach { $0.frame = region }
         bottomLine.frame = NSRect(x: 0, y: h - 34 - px, width: w, height: px)
@@ -269,6 +285,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     func beginSession(source: PanelSource, context: SearchContext) {
         if results.result == nil || results.result?.directoryScope != nil { results.clear() }
+        actionExecutor.dialog.reset()
         capturedMode = context.mode; forcedFileInput = nil
         queryRoute = .files(searchField.text)
         session.begin(source: source, context: context); _ = generation.next()
@@ -277,7 +294,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         updateDirectoryControls(); updateRouteControls()
     }
     func endSession() {
-        session.end(); _ = generation.next(); cancelPendingOpen()
+        session.end(); actionExecutor.dialog.reset(); _ = generation.next(); cancelPendingOpen()
         quickLook.close(); previewRequest = nil
     }
     private func cancelPendingOpen(reason: ActionFailure = .staleSession) {
@@ -317,7 +334,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     func startSearch(preserveSelection: Bool = false) {
-        session.queryChanged(); cancelPendingOpen(); quickLook.close(); previewRequest = nil
+        session.queryChanged(); actionExecutor.dialog.reset(); cancelPendingOpen(); quickLook.close(); previewRequest = nil
         if forcedFileInput != searchField.text { forcedFileInput = nil }
         pendingNewSearch = preserveSelection
         results.cancelPendingRefresh()
@@ -602,8 +619,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         let request = event.request
         switch event.outcome {
         case .accepted:
-            if request.action == .open || request.action == .reveal { hidePanel?() }
+            if request.context.mode == .open || request.context.mode == .save {
+                if actionExecutor.dialog.isNavigating { (view.window as? SearchPanel)?.hide(endingSession: false) }
+            } else if request.action == .open || request.action == .reveal { hidePanel?() }
         case .verified:
+            if request.action == .contextNavigation || (request.action == .open && (request.context.mode == .open || request.context.mode == .save)) {
+                updateDialogControls(); session.end(); return
+            }
             switch request.action {
             case .copyPath: footer.showToast(.copiedPath, value: request.target.url.path)
             case .copyName: footer.showToast(.copiedName, value: request.target.name)
@@ -612,6 +634,9 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             default: break
             }
         case .cancelled(let failure), .failed(let failure):
+            if failure == .dialogManual || failure == .dialogFailed {
+                updateDialogControls(); (view.window as? SearchPanel)?.resumeDialog()
+            }
             if failure == .sourceUnavailable {
                 footer.warning = true; footer.actionable = false
                 footer.text = L10n.text("source.unavailable", request.target.sourceName)
@@ -636,7 +661,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         let actions: [FileAction?] = [.open, .reveal, .preview, nil, .copyFile, .copyPath, .copyName, nil, .trash, nil, .contextNavigation]
         for action in actions {
             guard let action else { menu.addItem(.separator()); continue }
-            let item = NSMenuItem(title: L10n.text("ctx." + action.rawValue), action: #selector(contextAction(_:)), keyEquivalent: "")
+            let titleKey = action == .open && session.context.mode == .save ? "dialog.useDirectory" : "ctx." + action.rawValue
+            let item = NSMenuItem(title: L10n.text(titleKey), action: #selector(contextAction(_:)), keyEquivalent: "")
             item.target = self
             let request = requestAction(action)
             item.representedObject = request
@@ -655,6 +681,51 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         guard let request = item.representedObject as? ActionRequest else { return }
         performAction(request.action, request: request)
     }
+    var isDialogMode: Bool { session.context.mode == .open || session.context.mode == .save }
+    private func updateDialogControls() {
+        guard isViewLoaded else { return }
+        for control in [dialogHint, dialogPath, dialogCopyButton, dialogOrdinaryButton] as [NSView] { control.isHidden = !isDialogMode }
+        guard isDialogMode else { view.needsLayout = true; return }
+        let adapter = actionExecutor.dialog
+        let key = adapter.path == nil ? "dialog.manual" : adapter.status.localizationKey
+        if adapter.status == .manual, let file = adapter.fileToSelect { dialogHint.stringValue = L10n.text("dialog.manualFile", file.lastPathComponent) }
+        else { dialogHint.stringValue = L10n.text(key) }
+        dialogHint.toolTip = dialogHint.stringValue
+        dialogPath.stringValue = adapter.path?.path ?? L10n.text(session.context.mode == .save ? "dialog.saveHint" : "dialog.openHint")
+        dialogPath.toolTip = dialogPath.stringValue
+        dialogCopyButton.title = L10n.text("dialog.copy")
+        dialogCopyButton.isEnabled = adapter.path != nil && adapter.token.map(session.isCurrent) == true && !adapter.isNavigating
+        dialogOrdinaryButton.title = L10n.text("session.ordinary")
+        view.needsLayout = true
+    }
+    @objc func copyDialogPath() {
+        let adapter = actionExecutor.dialog
+        guard !adapter.isNavigating, let path = adapter.path, let token = adapter.token, session.isCurrent(token) else { return }
+        if actionExecutor.system.copy(.copyPath, path, path.lastPathComponent) { footer.showToast(.copiedPath, value: path.path) }
+        else { footer.showMessage("action.clipboardRejected", snapshot: snapshot) }
+    }
+    @objc private func exitDialogMode() { setSearchMode(.ordinary); searchField.focus() }
+
+    /// Quick Switch is a user choice, and must revalidate the captured candidate.
+    func navigateDirectory(_ candidate: DirectoryCandidate, token: SearchSessionToken) {
+        guard isDialogMode, session.isCurrent(token) else { return }
+        guard candidate.availability == .available || candidate.availability == .unindexed,
+              directoryCandidates.contains(where: { $0.id == candidate.id && $0.url == candidate.url && $0.finderDirectory == candidate.finderDirectory && ($0.availability == .available || $0.availability == .unindexed) }),
+              candidate.finderDirectory.map({ Date().timeIntervalSince($0.observedAt) >= 0 && Date().timeIntervalSince($0.observedAt) <= 120 && session.context.finderDirectoryIsCurrent?() == true }) ?? true else {
+            footer.showMessage("dialog.staleDirectory", snapshot: snapshot); return
+        }
+        let adapter = actionExecutor.dialog
+        let outcome = adapter.navigate(directory: candidate.url, file: nil, context: session.context.dialog,
+                                       token: token, host: session.context.target, isCurrent: { [weak self] in self?.session.isCurrent(token) == true }) { [weak self] outcome in
+            guard let self, self.session.isCurrent(token) else { return }
+            self.updateDialogControls()
+            if outcome == .verified { self.session.end() }
+            else { (self.view.window as? SearchPanel)?.resumeDialog() }
+        }
+        if outcome == .accepted { (view.window as? SearchPanel)?.hide(endingSession: false) }
+        updateDialogControls()
+    }
+
     private var effectiveOptions: SearchOptions {
         var options = filters.options
         switch session.context.mode {
@@ -692,8 +763,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     @objc private func showModes() {
         let menu = NSMenu(); menu.delegate = self
-        var modes: [SearchMode] = [.ordinary, .application]
-        if capturedMode != .ordinary && capturedMode != .application { modes.insert(capturedMode, at: 0) }
+        var modes: [SearchMode] = [.ordinary, .application, .open, .save]
+        if capturedMode == .finder { modes.insert(capturedMode, at: 0) }
         for mode in modes {
             let item = NSMenuItem(title: L10n.text("session." + mode.rawValue), action: #selector(selectMode(_:)), keyEquivalent: "")
             item.target = self; item.representedObject = ModeMenuRequest(token: session.token, mode: mode)
@@ -709,6 +780,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private func updateRouteControls() {
         guard isViewLoaded else { return }
         modeButton.title = L10n.text("session." + session.context.mode.rawValue)
+        updateDialogControls()
         footer.contextText = modeButton.title
         fileSearchButton.title = L10n.text("launcher.forceFiles")
         switch queryRoute {
@@ -798,7 +870,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                 let item = NSMenuItem(title: candidate.name + " · " + (candidate.sourceName.isEmpty ? L10n.text("directory." + candidate.availability.rawValue) : candidate.sourceName + " · " + L10n.text("directory." + candidate.availability.rawValue)), action: nil, keyEquivalent: "")
                 item.toolTip = candidate.url.path
                 let submenu = NSMenu(); submenu.autoenablesItems = false
-                for key in ["scope", "copy", "favorite"] {
+                if let finder = candidate.finderDirectory {
+                    item.title += " · " + L10n.text("dialog.finderSource", finder.method.rawValue, DateFormatter.localizedString(from: finder.observedAt, dateStyle: .none, timeStyle: .short))
+                }
+                for key in (isDialogMode ? ["handoff", "scope", "copy", "favorite"] : ["scope", "copy", "favorite"]) {
                     let action = NSMenuItem(title: L10n.text("directory." + key), action: #selector(directoryAction(_:)), keyEquivalent: "")
                     action.target = self; action.identifier = NSUserInterfaceItemIdentifier(key)
                     action.representedObject = DirectoryMenuRequest(token: session.token, candidate: candidate)
@@ -829,6 +904,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
         guard candidate.availability == .available || candidate.availability == .unindexed,
               favorites.system.check(candidate.url) == .available else { return }
+        if item.identifier?.rawValue == "handoff" { navigateDirectory(candidate, token: request.token); return }
         if item.identifier?.rawValue == "scope" { setDirectoryScope(candidate.url) }
         else { do { try favorites.add(candidate.url) } catch { footer.showMessage("directory.error", snapshot: snapshot) } }
     }
@@ -856,7 +932,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     private func hideIfInactive() {
-        if session.isActive && pendingOpen == nil && view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging { hidePanel?() }
+        if session.isActive && pendingOpen == nil && !actionExecutor.dialog.isNavigating && view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging { hidePanel?() }
     }
     func windowDidResignKey(_ notification: Notification) {
         // Quick Look visibility settles after the key-window transition.

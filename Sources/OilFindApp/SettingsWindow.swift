@@ -15,6 +15,8 @@ final class SettingsModel: ObservableObject {
     private var coverageExplanation: CoverageExplanation?
     private let snapshot: Bool
     @Published var loginError: String?
+    @Published var dialogWorkflowsEnabled: Bool
+    @Published var accessibilityGranted = false
     @Published var pinyinEnabled: Bool
     @Published var excludedPaths: [String]
     @Published var keyCode: UInt32
@@ -58,6 +60,7 @@ final class SettingsModel: ObservableObject {
         indexPackageContents = !snapshot && defaults.bool(forKey: "indexPackageContents")
         indexUserLibrary = !snapshot && defaults.bool(forKey: "indexUserLibrary")
         indexSystemDirs = !snapshot && defaults.bool(forKey: "indexSystemDirs")
+        dialogWorkflowsEnabled = !snapshot && defaults.bool(forKey: "dialogWorkflowsEnabled")
         pinyinEnabled = snapshot ? true : defaults.bool(forKey: "pinyinEnabled")
         excludedPaths = snapshot ? [] : ExcludedFolders.adding(defaults.stringArray(forKey: "userExcludedPaths") ?? [], to: [])
         keyCode = snapshot ? Shortcut.defaultKeyCode : UInt32(clamping: defaults.integer(forKey: "hotKeyCode"))
@@ -83,6 +86,7 @@ final class SettingsModel: ObservableObject {
     }
     func stopRefreshing() { timer?.invalidate(); timer = nil; cancelRecording() }
     func refresh() {
+        accessibilityGranted = !snapshot && SystemAccessibilityPermission().isTrusted()
         let wasGranted = granted
         if !snapshot { launchAtLogin = SMAppService.mainApp.status == .enabled }
         granted = snapshot ? false : Permissions.hasFullDiskAccess()
@@ -127,6 +131,14 @@ final class SettingsModel: ObservableObject {
         } catch { loginError = error.localizedDescription }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         onContentChange?()
+    }
+    func setDialogWorkflows(_ enabled: Bool) {
+        dialogWorkflowsEnabled = enabled
+        if !snapshot { UserDefaults.standard.set(enabled, forKey: "dialogWorkflowsEnabled") }
+    }
+    func authorizeAccessibility() {
+        if !snapshot { _ = SystemAccessibilityPermission().requestTrust() }
+        refresh()
     }
     func setPinyin(_ enabled: Bool) {
         pinyinEnabled = enabled; UserDefaults.standard.set(enabled, forKey: "pinyinEnabled")
@@ -412,6 +424,15 @@ private struct SettingsForm: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Toggle(L10n.text("settings.pinyin"), isOn: Binding(get: { model.pinyinEnabled }, set: model.setPinyin))
                     hint(L10n.text("settings.pinyinHint"))
+                }
+            }
+            Section(L10n.text("dialog.settings")) {
+                Toggle(L10n.text("dialog.enabled"), isOn: Binding(get: { model.dialogWorkflowsEnabled }, set: model.setDialogWorkflows))
+                hint(L10n.text("dialog.settingsHint"))
+                HStack {
+                    Text(L10n.text(model.accessibilityGranted ? "dialog.permissionGranted" : "dialog.permissionDenied"))
+                    Spacer()
+                    Button(L10n.text("dialog.authorize"), action: model.authorizeAccessibility)
                 }
             }
             Section(L10n.text("settings.index")) {
