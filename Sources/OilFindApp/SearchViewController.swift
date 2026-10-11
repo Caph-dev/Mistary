@@ -21,12 +21,21 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     let quickLook = QuickLook()
     let session = SearchSession()
     let favorites: FavoritesStore
+    let launcher: LauncherPreferences
+    private var launcherObserver: AnyCancellable?
+    private let modeButton = NSButton(title: "", target: nil, action: nil)
+    private let fileSearchButton = NSButton(title: "", target: nil, action: nil)
+    private let routeHint = NSTextField(labelWithString: "")
+    private var capturedMode: SearchMode = .ordinary
+    private var forcedFileInput: String?
+    private(set) var queryRoute: QueryRoute = .files("")
     private let scopeButton = NSButton(title: "", target: nil, action: nil)
     private let directoryButton = NSButton(title: "", target: nil, action: nil)
     private let directoryHint = NSTextField(labelWithString: "")
     private let favoriteRows = NSStackView()
     private var favoritesObserver: AnyCancellable?
     private struct DirectoryMenuRequest { let token: SearchSessionToken; let candidate: DirectoryCandidate }
+    private struct ModeMenuRequest { let token: SearchSessionToken; let mode: SearchMode }
     var directoryCandidates: [DirectoryCandidate] {
         DirectoryCandidates.make(finder: session.context.finderDirectory ?? session.context.recentFinderDirectory, favorites: favorites, sources: snapshot ? (results.result?.sources ?? []) : searchSources)
     }
@@ -40,14 +49,18 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
         let executor = ActionExecutor(session: session, system: system, sources: { [weak self] in
             guard let self else { return [] }
-            return self.snapshot ? (self.results.result?.sources ?? []) : self.searchSources
+            return self.snapshot ? self.snapshotSources : self.searchSources
         })
         executor.onEvent = { [weak self] event in
             self?.actionDidFinish(event); self?.onActionEvent?(event)
         }
+        executor.onPaletteEvent = { [weak self] event in
+            self?.paletteActionDidFinish(event); self?.onPaletteActionEvent?(event)
+        }
         return executor
     }()
     var onActionEvent: ((ActionEvent) -> Void)?
+    var onPaletteActionEvent: ((PaletteActionEvent) -> Void)?
     var animateOpen: ((@escaping () -> Void) -> Void)?
     private var pendingOpen: ActionRequest?
     private var previewRequest: ActionRequest?
@@ -58,13 +71,15 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private var diagnostics: [QueryDiagnostic] = []
     private var snapshotNoAccess = false
     private let snapshot: Bool
-    private let queue = DispatchQueue(label: "com.oiloil.find.search", qos: .userInteractive)
+    private let queue: DispatchQueue
     private let generation = SearchGeneration(), cache = SearchCache()
     private var timer: Timer?
     private var stateView: NSView?
     private var languageObserver: NSObjectProtocol?
     private var menuTracking = false, dragging = false
     private var selectionAnchor: (sourceID: String, store: IndexStore, id: UInt32, path: String)?
+    private var paletteSelectionAnchor: String?
+    private var snapshotSources: [SearchSource] = []
     private var pendingNewSearch: Bool?
     var manager: IndexManager?
     var supplementaryProvider: SupplementarySearchProvider?
@@ -103,8 +118,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     var hidePanel: (() -> Void)?
     var onSettings: (() -> Void)?
-    init(snapshot: Bool, favorites: FavoritesStore? = nil) {
+    init(snapshot: Bool, favorites: FavoritesStore? = nil, launcher: LauncherPreferences? = nil, searchQueue: DispatchQueue? = nil) {
         self.snapshot = snapshot
+        self.queue = searchQueue ?? DispatchQueue(label: "com.oiloil.find.search", qos: .userInteractive)
+        self.launcher = launcher ?? (snapshot ? LauncherPreferences(url: nil) : .shared)
         self.favorites = favorites ?? (snapshot ? FavoritesStore(url: nil) : .shared)
         super.init(nibName: nil, bundle: nil)
     }
@@ -112,7 +129,19 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     override func loadView() { view = PanelSurface(snapshot: snapshot) }
     override func viewDidLoad() {
         super.viewDidLoad()
-        [searchField, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        [searchField, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, modeButton, fileSearchButton, routeHint, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        modeButton.bezelStyle = .rounded; modeButton.controlSize = .small
+        modeButton.target = self; modeButton.action = #selector(showModes)
+        fileSearchButton.bezelStyle = .rounded; fileSearchButton.controlSize = .small
+        fileSearchButton.target = self; fileSearchButton.action = #selector(forceFileSearch)
+        routeHint.font = .systemFont(ofSize: 11); routeHint.textColor = .secondaryLabelColor
+        routeHint.lineBreakMode = .byTruncatingMiddle
+        launcherObserver = launcher.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }; self.session.invalidateActions()
+                self.startSearch(preserveSelection: true)
+            }
+        }
         scopeButton.bezelStyle = .rounded; scopeButton.controlSize = .small
         scopeButton.target = self; scopeButton.action = #selector(toggleDirectoryScope)
         directoryButton.bezelStyle = .rounded; directoryButton.controlSize = .small
@@ -145,9 +174,11 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         results.onSelection = { [weak self] in
             guard let self else { return }
             self.refreshPreview()
+            self.paletteSelectionAnchor = self.results.selectedPaletteItem?.identity
             if let item = self.results.selectedItem {
                 self.selectionAnchor = (item.source.id, item.source.store, item.id, item.path)
-            }
+            } else { self.selectionAnchor = nil }
+            self.updateRouteControls()
         }
         results.onUserSelection = { [weak self] in
             guard let self, self.quickLook.isVisible else { return }
@@ -160,7 +191,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             if !active { self?.hideIfInactive() }
         }
         results.onPasteboardWriter = { [weak self] row in
-            guard let self, let item = self.results.item(at: row),
+            guard let self else { return nil }
+            if let item = self.results.paletteItem(at: row), case .application(let app) = item,
+               let request = self.actionExecutor.capture(.copyFile, paletteItem: item), self.actionExecutor.validate(request) == nil { return app.url as NSURL }
+            guard let item = self.results.item(at: row),
                   let request = self.actionExecutor.capture(.copyFile, item: item),
                   self.actionExecutor.validate(request) == nil else { return nil }
             return request.target.url as NSURL
@@ -184,7 +218,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         filters.localize(); footer.localize(); empty.localize(); indexing.localize(); syntax.localize(); results.localize()
         searchField.localize()
         footer.contextText = L10n.text("session." + session.context.mode.rawValue)
-        updateDirectoryControls()
+        updateDirectoryControls(); updateRouteControls()
         if let result = results.result { updateFooter(result) }
         else if stateView === indexing { footer.text = L10n.text("footer.indexing", Presentation.countText(indexing.count)) }
         refreshProgress()
@@ -200,8 +234,11 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         directoryButton.frame = NSRect(x: 128, y: 109 + px, width: 104, height: 24)
         directoryHint.frame = NSRect(x: 242, y: 115 + px, width: max(0, w - 260), height: 16)
         let favoriteHeight: CGFloat = favoriteRows.isHidden ? 0 : CGFloat(favoriteRows.arrangedSubviews.count) * 26
-        favoriteRows.frame = NSRect(x: 22, y: 140 + px, width: w - 44, height: favoriteHeight)
-        let top: CGFloat = 140 + px + favoriteHeight
+        modeButton.frame = NSRect(x: 18, y: 140 + px, width: 120, height: 24)
+        fileSearchButton.frame = NSRect(x: 146, y: 140 + px, width: 180, height: 24)
+        routeHint.frame = NSRect(x: 336, y: 145 + px, width: max(0, w - 354), height: 18)
+        favoriteRows.frame = NSRect(x: 22, y: 172 + px, width: w - 44, height: favoriteHeight)
+        let top: CGFloat = 172 + px + favoriteHeight
         let region = NSRect(x: 0, y: top, width: w, height: max(0, h - top - 34 - px))
         [results, empty, indexing, syntax].forEach { $0.frame = region }
         bottomLine.frame = NSRect(x: 0, y: h - 34 - px, width: w, height: px)
@@ -212,7 +249,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         let previous: NSView = stateView ?? (results as NSView)
         stateView = state == .empty ? empty : state == .indexing ? indexing : nil
         let target: NSView = stateView ?? (results as NSView)
-        footer.actionable = !syntaxVisible && stateView == nil && (results.result?.total ?? 0) > 0
+        footer.actionable = !syntaxVisible && stateView == nil && results.selectedItem != nil
         guard previous !== target else { return }
         let animate = !snapshot && view.window?.isVisible == true && previous !== target
         for item in [results, empty, indexing] as [NSView] {
@@ -231,11 +268,13 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     func beginSession(source: PanelSource, context: SearchContext) {
-        if results.result?.directoryScope != nil { results.clear() }
+        if results.result == nil || results.result?.directoryScope != nil { results.clear() }
+        capturedMode = context.mode; forcedFileInput = nil
+        queryRoute = .files(searchField.text)
         session.begin(source: source, context: context); _ = generation.next()
         cancelPendingOpen(); results.cancelPendingRefresh(); quickLook.close(); previewRequest = nil
         footer.contextText = L10n.text("session." + context.mode.rawValue)
-        updateDirectoryControls()
+        updateDirectoryControls(); updateRouteControls()
     }
     func endSession() {
         session.end(); _ = generation.next(); cancelPendingOpen()
@@ -247,9 +286,14 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     func panelWillShow() {
         supplementaryProvider?.userActivity(visible: true, typing: false)
+        if case .files = routeInput() {} else { startSearch(preserveSelection: true); return }
         let currentQuery = Query.parse(searchField.text, store: manager?.store)
-        if let result = results.result, result.isCurrent(searchSources),
-           result.query.raw == currentQuery.raw, result.directoryScope == session.directoryScope.map({ DirectoryScope(path: $0.path) }), !currentQuery.isTimeDependent,
+        let requestedOptions = effectiveOptions
+        if let result = results.result, result.isCurrent(searchSources), launcher.aliases.isEmpty, result.launcherItems.isEmpty,
+           let options = result.single?.options ?? result.multiple?.results.first?.options,
+           options.kind == requestedOptions.kind, options.sort == requestedOptions.sort,
+           options.ascending == requestedOptions.ascending, options.pinyin == requestedOptions.pinyin,
+           result.query.raw == currentQuery.raw, result.directoryScope == requestedOptions.directoryScope, !currentQuery.isTimeDependent,
            Date().timeIntervalSince(result.createdAt) <= 600 { return }
         startSearch(preserveSelection: true)
     }
@@ -260,9 +304,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     func managerStateChanged(_ state: IndexManager.State) {
         refreshProgress()
-        if manager?.store == nil { setState(.indexing) }
+        if manager?.store == nil, results.displayCount == 0, case .files = queryRoute { setState(.indexing) }
     }
     private func refreshProgress() {
+        if !searchField.editor.hasMarkedText(), case .files = queryRoute {} else { return }
         if let result = results.result, result.query.isEmpty { updateFooter(result) }
         guard let manager else { return }
         searchField.indexing = manager.state == .scanning || manager.isRescanning
@@ -273,6 +318,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     func startSearch(preserveSelection: Bool = false) {
         session.queryChanged(); cancelPendingOpen(); quickLook.close(); previewRequest = nil
+        if forcedFileInput != searchField.text { forcedFileInput = nil }
         pendingNewSearch = preserveSelection
         results.cancelPendingRefresh()
         search(refresh: false, preserveSelection: preserveSelection)
@@ -290,11 +336,27 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private func search(refresh: Bool, preserveSelection: Bool) {
         supplementaryProvider?.userActivity(visible: view.window?.isVisible == true, typing: !refresh && !preserveSelection)
         let token = generation.next(), sessionToken = session.token
-        let sources = searchSources
-        guard let store = sources.first?.store else { refreshProgress(); return }
-        var options = filters.options
-        options.directoryScope = session.directoryScope.map { DirectoryScope(path: $0.path) }
-        if !snapshot { options.pinyin = UserDefaults.standard.bool(forKey: "pinyinEnabled") }
+        guard !searchField.editor.hasMarkedText() else { return }
+        queryRoute = routeInput(); updateRouteControls()
+        switch queryRoute {
+        case .waiting, .web:
+            pendingNewSearch = nil; diagnostics = []
+            if case .web(let item) = queryRoute { results.showCommands([.web(item)], preserveSelection: preserveSelection) }
+            else { results.showCommands([]) }
+            setState(nil); footer.warning = false
+            footer.actionable = false
+            if case .web(let item) = queryRoute { footer.text = item.keyword.name + " · ↩ " + L10n.text("hint.open") }
+            else { footer.text = routeHint.stringValue }
+            return
+        case .files: break
+        }
+        let aliases = launcherCandidates()
+        let sources = snapshot ? snapshotSources : searchSources
+        guard let store = sources.first?.store else {
+            pendingNewSearch = nil; results.showCommands(aliases, preserveSelection: preserveSelection)
+            setState(aliases.isEmpty ? .indexing : nil); refreshProgress(); return
+        }
+        let options = effectiveOptions
         let query = editingQuery(store: store), previous = results.result
         updateDirectoryControls()
         let cancelled = { [generation] in !generation.current(token) }
@@ -306,6 +368,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             supplementQueue.async { box.hits = supplementary(); group.leave() }
         }
         let anchor = refresh || preserveSelection ? selectionAnchor : nil
+        let paletteAnchor = refresh || preserveSelection ? paletteSelectionAnchor : nil
         queue.async { [weak self] in
             guard let self, self.generation.current(token) else { return }
             let found: SearchPresentation
@@ -328,8 +391,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                 guard let result = MultiSearcher.search(query, options: options, in: sources, previous: previous?.multiple, caches: self.sourceCaches, isCancelled: { !self.generation.current(token) }), self.generation.current(token) else { return }
                 found = SearchPresentation(result)
             }
+            found.addAliases(aliases)
             let anchoredRow = anchor.flatMap { found.index(sourceID: $0.sourceID, store: $0.store, id: $0.id, path: $0.path) }
-            let row = anchoredRow ?? 0
+            let row = anchoredRow.map { $0 + found.launcherItems.count }
+                ?? paletteAnchor.flatMap { id in found.launcherItems.firstIndex { $0.identity == id } } ?? 0
             let deferNames = anchor != nil && anchoredRow == nil && supplementary != nil && previous?.query.raw == query.raw
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation.current(token), self.session.isCurrent(sessionToken) else { return }
@@ -348,7 +413,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
                     if box.hits.isEmpty && !deferNames { return }
                     let combined = box.hits.isEmpty ? found : found.supplement(box.hits, options: options)
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.generation.current(token), self.session.isCurrent(sessionToken), combined.isCurrent(self.searchSources) else { return }
+                        guard let self, self.generation.current(token), self.session.isCurrent(sessionToken), combined.isCurrent(self.snapshot ? self.snapshotSources : self.searchSources) else { return }
                         self.pendingNewSearch = nil
                         self.results.refresh(combined)
                     }
@@ -358,6 +423,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     func present(_ result: SearchResult, selection: Int = 0, resetScroll: Bool = true) { present(SearchPresentation(result), selection: selection, resetScroll: resetScroll) }
     func present(_ result: SearchPresentation, selection: Int = 0, resetScroll: Bool = true) {
+        if snapshot { snapshotSources = result.sources }
         results.show(result, selection: selection, resetScroll: resetScroll)
         resultDidChange(result)
     }
@@ -368,6 +434,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         })
     }
     private func refreshDiagnostics() {
+        guard case .files = queryRoute else { return }
         let query = editingQuery(store: manager?.store ?? results.result?.store)
         guard let result = results.result, result.query.raw == query.raw else { return }
         diagnostics = query.diagnostics
@@ -379,7 +446,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     func toggleSyntax(_ show: Bool? = nil) {
         let visible = show ?? !syntaxVisible
         syntaxVisible = visible
-        footer.actionable = !visible && stateView == nil && (results.result?.total ?? 0) > 0
+        footer.actionable = !visible && stateView == nil && results.selectedItem != nil
         syntax.isHidden = false
         Theme.Motion.opacity(syntax, to: visible ? 1 : 0, using: snapshot ? nil : Theme.Motion.chip)
         if let layer = syntax.layer { Theme.Motion.animate(layer, "transform.translation.y", to: visible ? 0 : 8, using: snapshot ? nil : Theme.Motion.chip) }
@@ -391,7 +458,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private func resultDidChange(_ result: SearchPresentation) {
         updateDirectoryControls()
         configureEmpty(result)
-        setState(result.total == 0 ? .empty : nil)
+        setState(result.displayCount == 0 ? .empty : nil)
         updateFooter(result)
         refreshProgress()
     }
@@ -402,7 +469,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             let count = Presentation.countText(result.sources.reduce(0) { count, source in count + source.store.read { source.store.liveCount } })
             footer.text = L10n.text("footer.recent", count)
         } else {
-            footer.text = L10n.text(result.sortedCount < result.total ? "footer.partial" : "footer.results", Presentation.countText(result.total), Presentation.elapsedText(result.elapsedMs))
+            footer.text = L10n.text(result.sortedCount < result.total ? "footer.partial" : "footer.results", Presentation.countText(result.total + result.launcherItems.count), Presentation.elapsedText(result.elapsedMs))
         }
     }
     func prepareSnapshot(state: String, query: String, options: SearchOptions, store: IndexStore?, selection: Int, additionalSources: [SearchSource] = []) throws {
@@ -411,6 +478,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         if state == "indexing" {
             setState(.indexing); indexing.updateCount(1_234_567); searchField.indexing = true
             footer.text = L10n.text("footer.indexing", Presentation.countText(1_234_567)); return
+        }
+        if state == "results" {
+            if let store { snapshotSources = [SearchSource(id: "startup", displayName: "", isOnline: true, store: store)] + additionalSources }
+            if case .files = routeInput() {} else { startSearch(); return }
         }
         if let store, let supplementaryProvider {
             let sources = [SearchSource(id: "startup", displayName: "", isOnline: true, store: store)] + additionalSources
@@ -455,7 +526,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         if syntaxVisible { return false }
         switch event.keyCode {
         case 126: if command { results.select(0, repeatKey: event.isARepeat) } else { results.move(-1, repeatKey: event.isARepeat) }; return true
-        case 125: if command { results.select((results.result?.count ?? 1) - 1, repeatKey: event.isARepeat) } else { results.move(1, repeatKey: event.isARepeat) }; return true
+        case 125: if command { results.select(max(0, results.displayCount - 1), repeatKey: event.isARepeat) } else { results.move(1, repeatKey: event.isARepeat) }; return true
         case 116: results.page(-1, repeatKey: event.isARepeat); return true
         case 121: results.page(1, repeatKey: event.isARepeat); return true
         case 36, 76: if command { revealSelected() } else { openSelected() }; return true
@@ -481,6 +552,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
     }
     func requestAction(_ action: FileAction) -> ActionRequest? {
+        guard !searchField.editor.hasMarkedText(), results.selectedPaletteItem?.actions.contains(action) == true else { return nil }
         guard stateView == nil, let item = results.selectedItem else { return nil }
         return actionExecutor.capture(action, item: item)
     }
@@ -500,7 +572,12 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     private func copyName() { performAction(.copyName) }
     private func trashSelected() { performAction(.trash) }
     func performAction(_ action: FileAction, request captured: ActionRequest? = nil, togglingPreview: Bool = true) {
+        guard !searchField.editor.hasMarkedText() else { return }
         guard (view.window as? SearchPanel)?.hiding != true else { return }
+        if captured == nil, let item = results.selectedPaletteItem, results.selectedItem == nil {
+            guard stateView == nil, let request = actionExecutor.capture(action, paletteItem: item) else { return }
+            actionExecutor.execute(request); return
+        }
         if action == .preview && togglingPreview && quickLook.isVisible {
             quickLook.close(); previewRequest = nil; return
         }
@@ -545,6 +622,17 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     }
     func contextMenu() -> NSMenu {
         let menu = NSMenu(); menu.autoenablesItems = false; menu.delegate = self
+        if let paletteItem = results.selectedPaletteItem, results.selectedItem == nil {
+            for action in paletteItem.actions {
+                let item = NSMenuItem(title: L10n.text("ctx." + action.rawValue), action: #selector(paletteContextAction(_:)), keyEquivalent: "")
+                item.target = self
+                let request = actionExecutor.capture(action, paletteItem: paletteItem)
+                item.representedObject = request
+                item.isEnabled = request.map { actionExecutor.validate($0) == nil } ?? false
+                menu.addItem(item)
+            }
+            return menu
+        }
         let actions: [FileAction?] = [.open, .reveal, .preview, nil, .copyFile, .copyPath, .copyName, nil, .trash, nil, .contextNavigation]
         for action in actions {
             guard let action else { menu.addItem(.separator()); continue }
@@ -566,6 +654,99 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     @objc func contextAction(_ item: NSMenuItem) {
         guard let request = item.representedObject as? ActionRequest else { return }
         performAction(request.action, request: request)
+    }
+    private var effectiveOptions: SearchOptions {
+        var options = filters.options
+        switch session.context.mode {
+        case .application: options.kind = 2
+        case .save: options.kind = 1
+        default: break
+        }
+        options.directoryScope = session.directoryScope.map { DirectoryScope(path: $0.path) }
+        if !snapshot { options.pinyin = UserDefaults.standard.bool(forKey: "pinyinEnabled") }
+        return options
+    }
+    private func routeInput() -> QueryRoute {
+        QueryRouter(keywords: launcher.keywords).route(searchField.text, mode: session.context.mode,
+            isComposing: searchField.editor.hasMarkedText(), forceFiles: forcedFileInput == searchField.text)
+    }
+    private func launcherCandidates() -> [PaletteItem] {
+        guard forcedFileInput == nil, session.context.mode == .ordinary || session.context.mode == .application,
+              session.directoryScope == nil, effectiveOptions.kind == nil || effectiveOptions.kind == 2 else { return [] }
+        let text = searchField.text
+        guard !text.contains(where: { ":/\\~*?!|".contains($0) }) else { return [] }
+        let query = Query.parse(text)
+        guard query.diagnostics.isEmpty, query.clauses.allSatisfy({ clause in
+            clause.alternatives.count == 1 && clause.alternatives.allSatisfy { atom in
+                if case .name = atom.matcher { return !atom.negated }; return false
+            }
+        }) else { return [] }
+        return launcher.candidates(for: text)
+    }
+    func setSearchMode(_ mode: SearchMode) {
+        session.setMode(mode); forcedFileInput = nil
+        results.clear(); startSearch()
+    }
+    @objc func forceFileSearch() {
+        forcedFileInput = searchField.text; startSearch(); searchField.focus()
+    }
+    @objc private func showModes() {
+        let menu = NSMenu(); menu.delegate = self
+        var modes: [SearchMode] = [.ordinary, .application]
+        if capturedMode != .ordinary && capturedMode != .application { modes.insert(capturedMode, at: 0) }
+        for mode in modes {
+            let item = NSMenuItem(title: L10n.text("session." + mode.rawValue), action: #selector(selectMode(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = ModeMenuRequest(token: session.token, mode: mode)
+            item.state = session.context.mode == mode ? .on : .off
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: 26), in: modeButton)
+    }
+    @objc private func selectMode(_ item: NSMenuItem) {
+        guard let request = item.representedObject as? ModeMenuRequest, session.isCurrent(request.token) else { return }
+        setSearchMode(request.mode); searchField.focus()
+    }
+    private func updateRouteControls() {
+        guard isViewLoaded else { return }
+        modeButton.title = L10n.text("session." + session.context.mode.rawValue)
+        footer.contextText = modeButton.title
+        fileSearchButton.title = L10n.text("launcher.forceFiles")
+        switch queryRoute {
+        case .files:
+            fileSearchButton.isHidden = true
+            routeHint.stringValue = launcher.error == nil ? "" : L10n.text("launcher.error")
+            if let item = results.selectedPaletteItem, case .application(let app) = item { routeHint.stringValue = app.url.path }
+        case .waiting(let keyword):
+            fileSearchButton.isHidden = false; routeHint.stringValue = L10n.text("launcher.waiting", keyword.name)
+            footer.contextText = L10n.text("launcher.webMode")
+            footer.text = routeHint.stringValue
+        case .web(let web):
+            fileSearchButton.isHidden = false; routeHint.stringValue = L10n.text("launcher.web", web.keyword.name)
+            footer.contextText = L10n.text("launcher.webMode")
+            footer.text = web.keyword.name + " · ↩ " + L10n.text("hint.open")
+        }
+        routeHint.toolTip = routeHint.stringValue
+        footer.actionable = !syntaxVisible && stateView == nil && results.selectedItem != nil
+    }
+    private func paletteActionDidFinish(_ event: PaletteActionEvent) {
+        guard session.isCurrent(event.request.token) else { return }
+        switch event.outcome {
+        case .accepted:
+            if event.request.action == .open || event.request.action == .reveal { hidePanel?() }
+        case .verified:
+            if case .application(let app) = event.request.item {
+                switch event.request.action {
+                case .copyName: footer.showToast(.copiedName, value: app.name)
+                case .copyPath: footer.showToast(.copiedPath, value: app.url.path)
+                default: footer.showMessage("action.copiedFile", value: app.name, snapshot: snapshot)
+                }
+            }
+        case .failed(let failure), .cancelled(let failure): footer.showMessage("action." + failure.rawValue, snapshot: snapshot)
+        }
+    }
+    @objc func paletteContextAction(_ item: NSMenuItem) {
+        guard !searchField.editor.hasMarkedText(), let request = item.representedObject as? PaletteActionRequest else { return }
+        actionExecutor.execute(request)
     }
     func setDirectoryScope(_ url: URL?) {
         session.setDirectoryScope(url)

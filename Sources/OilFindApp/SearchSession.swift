@@ -43,6 +43,12 @@ final class SearchSession {
     func setDirectoryScope(_ url: URL?) {
         directoryScope = url?.standardizedFileURL; queryChanged()
     }
+    func setMode(_ mode: SearchMode) {
+        context = SearchContext(mode: mode, target: context.target, directoryScope: context.directoryScope,
+                                finderDirectory: context.finderDirectory, finderUnavailable: context.finderUnavailable,
+                                recentFinderDirectory: context.recentFinderDirectory)
+        queryChanged()
+    }
     func queryChanged() { queryGeneration &+= 1; invalidateActions() }
     func invalidateActions() { actionGeneration &+= 1 }
     func end() { isActive = false; invalidateActions() }

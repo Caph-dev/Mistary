@@ -5,6 +5,29 @@ import COilFind
 /// A submitted query snapshot. The single-store path keeps its original arrays.
 final class SearchPresentation {
     let single: SearchResult?
+    var launcherItems: [PaletteItem] = []
+    var displayCount: Int { launcherItems.count + count }
+    /// Only app hits need paths; ordinary file rows stay lazy.
+    func addAliases(_ candidates: [PaletteItem]) {
+        let wanted = Set(candidates.compactMap { item -> String? in
+            if case .application(let app) = item { return ApplicationPaletteItem.normalizedURL(app.url).path }; return nil
+        })
+        var matched: Set<String> = []
+        if !wanted.isEmpty {
+            for i in 0..<count {
+                guard let hit = row(i) else { continue }
+                hit.source.store.read {
+                    let store = hit.source.store
+                    guard Int(hit.id) < store.count, store.isLive(hit.id), store.kind[Int(hit.id)] == 2 else { return }
+                    let path = store.path(hit.id)
+                    if wanted.contains(path) { matched.insert(path) }
+                }
+            }
+        }
+        launcherItems = candidates.filter { item in
+            if case .application(let app) = item { return !matched.contains(ApplicationPaletteItem.normalizedURL(app.url).path) }; return false
+        }
+    }
     let multiple: MultiSearchResult?
     private var supplementedRows: [(source: SearchSource, id: UInt32)]?
     private var details: [String: [UInt32: SupplementaryHit]] = [:]
@@ -67,6 +90,7 @@ final class SearchPresentation {
             }
             extra.sort(by: better); rows.append(contentsOf: extra)
             if options.sort != .relevance { rows.sort(by: better) }
+            result.launcherItems = launcherItems
             result.supplementedRows = rows; return result
         }
         return mergeLocked(0)
@@ -82,6 +106,7 @@ final class SearchPresentation {
         return multiple!.items.firstIndex { multiple!.sources[$0.sourceIndex].id == sourceID && $0.entryID == resolved }
     }
     func sameRows(as other: SearchPresentation) -> Bool {
+        guard launcherItems.map(\.identity) == other.launcherItems.map(\.identity) else { return false }
         if supplementedRows == nil, other.supplementedRows == nil, let single, let rhs = other.single { return single.store === rhs.store && single.items == rhs.items }
         guard count == other.count else { return false }
         for i in 0..<count {
@@ -90,7 +115,7 @@ final class SearchPresentation {
         return true
     }
     func sameMetadata(as other: SearchPresentation) -> Bool {
-        guard details.isEmpty && other.details.isEmpty else { return false }
+        guard details.isEmpty && other.details.isEmpty && launcherItems.isEmpty && other.launcherItems.isEmpty else { return false }
         let a = sources, b = other.sources
         guard a.count == b.count else { return false }
         let versions = single.map { [$0.storeVersion] } ?? multiple!.results.map(\.storeVersion)

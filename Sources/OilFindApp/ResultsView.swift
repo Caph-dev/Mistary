@@ -64,6 +64,29 @@ final class ResultCell: NSTableCellView {
             icon.layer?.backgroundColor = (displayingThumbnail ? NSColor.quaternaryLabelColor.withAlphaComponent(0.08) : NSColor.clear).cgColor
         }
     }
+    func configure(_ item: PaletteItem, icons: IconProvider) {
+        configuration += 1
+        let token = configuration
+        displayingThumbnail = false; updateThumbnailStyle()
+        detailLabel.isHidden = true; detailLabel.stringValue = ""
+        dateLabel.stringValue = ""; sizeLabel.stringValue = ""
+        switch item {
+        case .application(let app):
+            nameLabel.attributedStringValue = NSAttributedString(string: app.name, attributes: [.font: nameLabel.font!, .foregroundColor: app.available ? NSColor.labelColor : NSColor.tertiaryLabelColor])
+            pathLabel.stringValue = app.url.path + (app.available ? "" : " · " + L10n.text("launcher.missing"))
+            toolTip = app.url.path
+            icon.image = icons.icon(name: app.url.lastPathComponent, path: app.url.path, flags: SiftFlag.dir | SiftFlag.package, kind: 2, resolveFileIcon: app.available) { [weak self] image in
+                guard let self, self.configuration == token else { return }; self.icon.image = image
+            }
+        case .web(let web):
+            nameLabel.attributedStringValue = NSAttributedString(string: web.text, attributes: [.font: nameLabel.font!, .foregroundColor: NSColor.labelColor])
+            pathLabel.stringValue = L10n.text("launcher.web", web.keyword.name)
+            toolTip = web.url.absoluteString
+            icon.image = NSImage(systemSymbolName: "globe", accessibilityDescription: web.keyword.name)
+        case .file: break
+        }
+        needsLayout = true
+    }
     func configure(_ item: ResultItem, query: Query, icons: IconProvider) {
         configuration += 1
         let token = configuration
@@ -173,6 +196,22 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
     private var scrolling: Bool { liveScrolling || wheelScrolling || momentumScrolling }
     let icons = IconProvider()
     var result: SearchPresentation?
+    private var commandItems: [PaletteItem] = []
+    var displayCount: Int { result?.displayCount ?? commandItems.count }
+    func paletteItem(at row: Int) -> PaletteItem? {
+        guard row >= 0, row < displayCount else { return nil }
+        guard let result else { return commandItems[row] }
+        if row < result.launcherItems.count { return result.launcherItems[row] }
+        return .file(result, row: row - result.launcherItems.count)
+    }
+    var selectedPaletteItem: PaletteItem? { paletteItem(at: selectedRow) }
+    func showCommands(_ items: [PaletteItem], preserveSelection: Bool = false) {
+        let identity = preserveSelection ? selectedPaletteItem?.identity : nil
+        cancelPendingRefresh(); cancelPress(); hideHover(immediately: true)
+        refreshing = true; result = nil; commandItems = items; table.reloadData()
+        select(identity.flatMap { id in items.firstIndex { $0.identity == id } } ?? 0)
+        updateSelection(animated: false); refreshing = false; onSelection?()
+    }
     var currentSource: ((String) -> SearchSource?)?
     var onOpen: (() -> Void)?
     var onSelection: (() -> Void)?
@@ -183,8 +222,8 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
     var onRefreshApplied: ((SearchPresentation) -> Void)?
     var selectedRow: Int { table.selectedRow }
     var selectedID: UInt32? {
-        guard let result, selectedRow >= 0 && selectedRow < result.count else { return nil }
-        return result.row(selectedRow)?.id
+        guard case .file(let result, let row) = selectedPaletteItem else { return nil }
+        return result.row(row)?.id
     }
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -227,14 +266,14 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
     func show(_ result: SearchPresentation, selection: Int = 0, resetScroll: Bool = true) {
         cancelPendingRefresh(); hideHover(immediately: true)
         refreshing = true
-        self.result = result; table.reloadData()
+        self.result = result; commandItems = []; table.reloadData()
         select(selection)
         if resetScroll { scroll.contentView.scroll(to: NSPoint(x: 0, y: -6)); scroll.reflectScrolledClipView(scroll.contentView) }
         updateSelection(animated: false); refreshing = false
         recomputeHover(); onSelection?()
     }
     func clear() {
-        cancelPendingRefresh(); cancelPress(); result = nil
+        cancelPendingRefresh(); cancelPress(); result = nil; commandItems = []
         table.reloadData(); table.deselectAll(nil); updateSelection(animated: false); hideHover(immediately: true)
     }
     func cancelPendingRefresh() { pendingRefresh = nil }
@@ -252,8 +291,11 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
         pendingRefresh = nil
         let origin = scroll.contentView.bounds.origin
         var row = selectedRow
+        let selectedIdentity = selectedPaletteItem?.identity
         if action == .reloadPreservingViewport {
-            row = selectedItem.flatMap { result.index(sourceID: $0.source.id, store: $0.source.store, id: $0.id, path: $0.path) } ?? 0
+            if let item = selectedItem {
+                row = result.index(sourceID: item.source.id, store: item.source.store, id: item.id, path: item.path).map { $0 + result.launcherItems.count } ?? 0
+            } else { row = selectedIdentity.flatMap { id in result.launcherItems.firstIndex { $0.identity == id } } ?? 0 }
         }
         refreshing = true; self.result = result
         switch action {
@@ -262,7 +304,7 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
             hideHover(immediately: true)
             let visible = table.rows(in: table.visibleRect)
             if visible.location != NSNotFound {
-                let range = NSIntersectionRange(visible, NSRange(location: 0, length: result.count))
+                let range = NSIntersectionRange(visible, NSRange(location: 0, length: result.displayCount))
                 if range.length > 0 {
                     table.reloadData(forRowIndexes: IndexSet(integersIn: range.location..<NSMaxRange(range)), columnIndexes: IndexSet(integer: 0))
                 }
@@ -320,7 +362,7 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
     }
     deinit { scrollEnd?.cancel(); NotificationCenter.default.removeObserver(self) }
     func item(at row: Int) -> ResultItem? {
-        guard let result, let hit = result.row(row) else { return nil }
+        guard case .file(let result, let index) = paletteItem(at: row), let hit = result.row(index) else { return nil }
         let source: SearchSource
         if let currentSource { guard let current = currentSource(hit.source.id) else { return nil }; source = SearchSource(id: current.id, displayName: current.displayName, isOnline: current.isOnline && current.store === hit.source.store, store: hit.source.store) }
         else { source = hit.source }
@@ -328,7 +370,7 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
         return store.read {
             guard Int(id) < store.count, store.isLive(id) else { return nil }
             let name = store.name(id), parent = store.parentPath(id)
-            return ResultItem(detail: result.detail(at: row), id: id, source: source, name: name, parentPath: parent, path: parent == "/" ? "/" + name : parent + "/" + name,
+            return ResultItem(detail: result.detail(at: index), id: id, source: source, name: name, parentPath: parent, path: parent == "/" ? "/" + name : parent + "/" + name,
                               size: store.size(id), modified: store.modified(id), flags: store.flags[Int(id)], kind: store.kind[Int(id)])
         }
     }
@@ -338,15 +380,15 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
         setSelection(row, reveal: true)
     }
     private func setSelection(_ row: Int, reveal: Bool) {
-        guard let result, result.count > 0 else { table.deselectAll(nil); return }
-        let row = min(max(0, row), result.count - 1)
+        guard displayCount > 0 else { table.deselectAll(nil); return }
+        let row = min(max(0, row), displayCount - 1)
         table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         if reveal { table.scrollRowToVisible(row) }
     }
     func move(_ delta: Int, repeatKey: Bool = false) {
-        guard let result, result.count > 0 else { return }
+        guard displayCount > 0 else { return }
         let target = max(0, selectedRow) + delta
-        if !repeatKey && (target < 0 || target >= result.count) { nudge(delta) }
+        if !repeatKey && (target < 0 || target >= displayCount) { nudge(delta) }
         select(target, repeatKey: repeatKey)
     }
     func page(_ delta: Int, repeatKey: Bool = false) { select(max(0, selectedRow) + delta * max(1, Int(scroll.contentSize.height / Theme.rowHeight)), repeatKey: repeatKey) }
@@ -386,7 +428,7 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
         pendingPress = false; pressGeneration += 1
         if let layer = selectionPlate.layer { Theme.Motion.animate(layer, "transform.scale", to: 1, using: Theme.Motion.basic(Theme.Motion.press)) }
     }
-    func numberOfRows(in tableView: NSTableView) -> Int { result?.count ?? 0 }
+    func numberOfRows(in tableView: NSTableView) -> Int { displayCount }
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let identifier = NSUserInterfaceItemIdentifier("row")
         let view = tableView.makeView(withIdentifier: identifier, owner: self) as? ResultRow ?? ResultRow(frame: .zero)
@@ -397,6 +439,7 @@ final class ResultsView: FlippedView, NSTableViewDataSource, NSTableViewDelegate
         let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? ResultCell ?? ResultCell(frame: .zero)
         cell.identifier = identifier
         if let item = item(at: row), let result { cell.configure(item, query: result.query, icons: icons) }
+        else if let item = paletteItem(at: row) { cell.configure(item, icons: icons) }
         return cell
     }
     func tableViewSelectionDidChange(_ notification: Notification) {

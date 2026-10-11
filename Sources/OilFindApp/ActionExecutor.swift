@@ -11,6 +11,7 @@ enum FileAction: String, CaseIterable {
 enum ActionFailure: String, Error {
     case staleSession, sourceUnavailable, storeReplaced, targetChanged, fileUnavailable
     case systemRejected, clipboardRejected, trashNotVerified, contextUnavailable, alreadyDispatched, superseded
+    case applicationUnavailable, invalidURL, unsupportedAction
 }
 
 enum ActionOutcome: Equatable {
@@ -76,6 +77,20 @@ struct ActionRequest {
     let target: FileTargetSnapshot
 }
 
+struct PaletteActionRequest {
+    fileprivate let receipt = ActionReceipt()
+    let actionID: UUID
+    let token: SearchSessionToken
+    let action: FileAction
+    let item: PaletteItem
+    let identity: FileIdentity?
+}
+
+struct PaletteActionEvent {
+    let request: PaletteActionRequest
+    let outcome: ActionOutcome
+}
+
 /// All closures run on the main thread. Tests replace every external side effect.
 struct ActionSystem {
     var identity: (URL) -> FileIdentity? = FileIdentity.read
@@ -84,6 +99,12 @@ struct ActionSystem {
         return url.path.withCString { lstat($0, &info) } != 0 && errno == ENOENT
     }
     var open: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    var launcher = LauncherSystem()
+    var launch: (URL, @escaping (Bool) -> Void) -> Void = { url, completion in
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { app, error in
+            DispatchQueue.main.async { completion(app != nil && error == nil) }
+        }
+    }
     var reveal: (URL) -> Bool = { NSWorkspace.shared.activateFileViewerSelecting([$0]); return true }
     var preview: (URL) -> Bool = { _ in false }
     var copy: (FileAction, URL, String) -> Bool = { action, url, name in
@@ -113,10 +134,68 @@ final class ActionExecutor {
     var system: ActionSystem
     var sources: () -> [SearchSource]
     var onEvent: ((ActionEvent) -> Void)?
+    var onPaletteEvent: ((PaletteActionEvent) -> Void)?
     private var trashing: Set<URL> = []
 
     init(session: SearchSession, system: ActionSystem = ActionSystem(), sources: @escaping () -> [SearchSource]) {
         self.session = session; self.system = system; self.sources = sources
+    }
+    func capture(_ action: FileAction, paletteItem: PaletteItem) -> PaletteActionRequest? {
+        guard paletteItem.actions.contains(action) else { return nil }
+        let identity: FileIdentity?
+        switch paletteItem {
+        case .file: return nil
+        case .application(let app): identity = action.requiresOnline ? system.identity(app.url) : nil
+        case .web: identity = nil
+        }
+        return PaletteActionRequest(actionID: UUID(), token: session.token, action: action, item: paletteItem, identity: identity)
+    }
+    func validate(_ request: PaletteActionRequest) -> ActionFailure? {
+        guard session.isCurrent(request.token) else { return .staleSession }
+        guard session.context.mode == .ordinary || session.context.mode == .application else { return .contextUnavailable }
+        guard request.item.actions.contains(request.action) else { return .unsupportedAction }
+        switch request.item {
+        case .file: return .unsupportedAction
+        case .web(let web):
+            guard request.action == .open, web.keyword.enabled, web.keyword.searchURL(web.text) == web.url else { return .invalidURL }
+        case .application(let app):
+            if request.action.requiresOnline {
+                guard app.available, system.launcher.isApplication(app.url),
+                      app.bundleIdentifier == nil || system.launcher.bundleIdentifier(app.url) == app.bundleIdentifier,
+                      let identity = request.identity, let current = system.identity(app.url) else { return .applicationUnavailable }
+                guard identity == current else { return .targetChanged }
+            }
+        }
+        return nil
+    }
+    /// Nil means the workspace response is pending; acceptance is emitted later.
+    @discardableResult
+    func execute(_ request: PaletteActionRequest) -> ActionOutcome? {
+        guard request.receipt.consume() else { return .cancelled(.alreadyDispatched) }
+        if let failure = validate(request) { return emit(request, .cancelled(failure)) }
+        switch request.item {
+        case .web(let web): return emit(request, system.open(web.url) ? .accepted : .failed(.systemRejected))
+        case .application(let app):
+            switch request.action {
+            case .open:
+                var completed = false
+                system.launch(app.url) { [self] accepted in
+                    guard !completed else { return }; completed = true
+                    emit(request, accepted ? .accepted : .failed(.systemRejected))
+                }
+                // The event is emitted only after the workspace response.
+                return nil
+            case .reveal: return emit(request, system.reveal(app.url) ? .accepted : .failed(.systemRejected))
+            case .copyFile, .copyPath, .copyName:
+                return emit(request, system.copy(request.action, app.url, app.name) ? .verified : .failed(.clipboardRejected))
+            default: return emit(request, .failed(.unsupportedAction))
+            }
+        case .file: return emit(request, .failed(.unsupportedAction))
+        }
+    }
+    @discardableResult
+    private func emit(_ request: PaletteActionRequest, _ outcome: ActionOutcome) -> ActionOutcome {
+        onPaletteEvent?(PaletteActionEvent(request: request, outcome: outcome)); return outcome
     }
     func capture(_ action: FileAction, item: ResultItem) -> ActionRequest? {
         let store = item.source.store

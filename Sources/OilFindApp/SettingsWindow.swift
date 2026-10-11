@@ -9,6 +9,7 @@ final class SettingsModel: ObservableObject {
     @Published var launchAtLogin: Bool
     let update: UpdateManager
     let favorites: FavoritesStore
+    let launcher: LauncherPreferences
     private var languageObserver: NSObjectProtocol?
     private let languageDefaults: UserDefaults
     private var coverageExplanation: CoverageExplanation?
@@ -46,6 +47,7 @@ final class SettingsModel: ObservableObject {
     init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard) {
         self.snapshot = snapshot
         self.favorites = snapshot ? FavoritesStore(url: nil) : .shared
+        self.launcher = snapshot ? LauncherPreferences(url: nil) : .shared
         self.languageDefaults = languageDefaults
         self.language = L10n.language
         self.update = snapshot ? UpdateManager(snapshot: true) : .shared
@@ -254,6 +256,100 @@ private struct FavoriteSettingsRow: View {
     }
 }
 
+private struct LauncherSettingsSection: View {
+    @ObservedObject var store: LauncherPreferences
+    let window: () -> NSWindow?
+    @State private var failed = false
+    var body: some View {
+        Section(L10n.text("launcher.title")) {
+            Text(L10n.text("launcher.hint")).font(.footnote).foregroundStyle(.secondary)
+            ForEach(store.aliases) { entry in
+                LauncherAliasRow(store: store, entry: entry, failed: $failed)
+            }
+            Button(L10n.text("launcher.add")) {
+                guard let window = window() else { return }
+                let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.canChooseFiles = true
+                panel.treatsFilePackagesAsDirectories = false; panel.allowedContentTypes = [.application]
+                panel.allowsMultipleSelection = false
+                panel.beginSheetModal(for: window) { response in
+                    guard response == .OK, let url = panel.url else { return }
+                    do { try store.add(url, alias: url.deletingPathExtension().lastPathComponent); failed = false }
+                    catch { failed = true }
+                }
+            }
+            ForEach(store.keywords) { keyword in
+                LauncherKeywordRow(store: store, original: keyword, failed: $failed)
+            }
+            if failed { Text(L10n.text("launcher.invalid")).font(.footnote).foregroundStyle(.red) }
+            if store.error != nil {
+                Text(L10n.text("launcher.error")).font(.footnote).foregroundStyle(.red)
+                Button(L10n.text("launcher.reset")) {
+                    do { try store.reset(); failed = false } catch { failed = true }
+                }
+            }
+        }
+    }
+}
+
+private struct LauncherAliasRow: View {
+    @ObservedObject var store: LauncherPreferences
+    let entry: ApplicationAlias
+    @Binding var failed: Bool
+    @State private var alias = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                TextField(L10n.text("launcher.alias"), text: $alias)
+                    .onAppear { alias = entry.alias }
+                    .onChange(of: entry.alias) { _, value in alias = value }
+                Button(L10n.text("launcher.save")) {
+                    do { try store.rename(entry.id, alias: alias); failed = false } catch { failed = true }
+                }
+                Button(L10n.text("launcher.remove")) {
+                    do { try store.remove(entry.id); failed = false } catch { failed = true }
+                }
+            }
+            Text(entry.url.path + (store.system.isApplication(entry.url) ? "" : " · " + L10n.text("launcher.missing")))
+                .font(.footnote).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).help(entry.url.path)
+        }
+    }
+}
+
+private struct LauncherKeywordRow: View {
+    @ObservedObject var store: LauncherPreferences
+    let original: WebKeyword
+    @Binding var failed: Bool
+    @State private var keyword = ""
+    @State private var name = ""
+    @State private var endpoint = ""
+    @State private var parameter = ""
+    @State private var enabled = true
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                TextField(L10n.text("launcher.keyword"), text: $keyword)
+                Toggle(L10n.text("launcher.enabled"), isOn: $enabled)
+            }
+            TextField(L10n.text("launcher.engine"), text: $name)
+            TextField(L10n.text("launcher.endpoint"), text: $endpoint)
+            HStack {
+                TextField(L10n.text("launcher.parameter"), text: $parameter)
+                Button(L10n.text("launcher.save")) {
+                    guard let url = URL(string: endpoint) else { failed = true; return }
+                    var updated = store.keywords
+                    guard let i = updated.firstIndex(where: { $0.keyword == original.keyword }) else { return }
+                    updated[i] = WebKeyword(keyword: keyword, name: name, endpoint: url, parameter: parameter, enabled: enabled)
+                    do { try store.setKeywords(updated); failed = false } catch { failed = true }
+                }
+            }
+        }.onAppear { load() }.onChange(of: original) { _, _ in load() }
+    }
+    private func load() {
+        keyword = original.keyword; name = original.name; endpoint = original.endpoint.absoluteString
+        parameter = original.parameter; enabled = original.enabled
+    }
+}
+
 private struct UpdateSettingsRow: View {
     @ObservedObject var update: UpdateManager
     var body: some View {
@@ -370,6 +466,7 @@ private struct SettingsForm: View {
             } header: { Text(L10n.text("settings.scope")) }
               footer: { hint(L10n.text("settings.scopeHint")) }
             FavoriteSettingsSection(store: model.favorites, window: window)
+            LauncherSettingsSection(store: model.launcher, window: window)
             if let appExtension { appExtension.settingsSection(window: window) }
             Section {
                 if model.excludedPaths.isEmpty { Text(L10n.text("settings.noExcluded")).foregroundStyle(.secondary) }
