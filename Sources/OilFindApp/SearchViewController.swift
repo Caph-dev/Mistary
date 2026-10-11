@@ -15,6 +15,7 @@ private final class SearchGeneration {
 
 final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDelegate {
     let searchField = SearchField(frame: .zero)
+    let dragHandle = PanelDragHandle(frame: .zero)
     let filters = FilterBar(frame: .zero)
     let results = ResultsView(frame: .zero)
     let footer = FooterBar(frame: .zero)
@@ -139,6 +140,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         startSearch(preserveSelection: true)
     }
     var hidePanel: (() -> Void)?
+    var keepPanelOpen: () -> Bool = { false }
+    var onPanelMove: (() -> Void)?
     var onSettings: (() -> Void)?
     init(snapshot: Bool, favorites: FavoritesStore? = nil, launcher: LauncherPreferences? = nil, customActions: ActionDefinitions? = nil, savedFilters: SavedFiltersStore? = nil, usage: UsageStore? = nil, searchQueue: DispatchQueue? = nil) {
         self.snapshot = snapshot
@@ -154,7 +157,12 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
     override func loadView() { view = PanelSurface(snapshot: snapshot) }
     override func viewDidLoad() {
         super.viewDidLoad()
-        [searchField, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, modeButton, fileSearchButton, routeHint, dialogHint, dialogPath, dialogCopyButton, dialogOrdinaryButton, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        [searchField, dragHandle, topLine, filters, scopeButton, directoryButton, directoryHint, favoriteRows, modeButton, fileSearchButton, routeHint, dialogHint, dialogPath, dialogCopyButton, dialogOrdinaryButton, results, empty, indexing, bottomLine, footer, syntax].forEach(view.addSubview)
+        session.onContextUnavailable = { [weak self] in
+            guard let self else { return }
+            self.actionExecutor.dialog.reset(); self.cancelPendingOpen()
+            self.updateDialogControls()
+        }
         dialogHint.font = .systemFont(ofSize: 11); dialogHint.textColor = .secondaryLabelColor
         dialogHint.lineBreakMode = .byWordWrapping; dialogHint.maximumNumberOfLines = 2
         dialogPath.font = .systemFont(ofSize: 11); dialogPath.lineBreakMode = .byTruncatingMiddle
@@ -226,10 +234,8 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         }
         results.onContextMenu = { [weak self] _ in self?.contextMenu() }
         results.onRefreshApplied = { [weak self] result in self?.resultDidChange(result) }
-        results.onDragging = { [weak self] active in
-            self?.dragging = active
-            if !active { self?.hideIfInactive() }
-        }
+        results.onDragging = { [weak self] in self?.draggingChanged($0) }
+        dragHandle.onDragging = { [weak self] in self?.draggingChanged($0) }
         results.onPasteboardWriter = { [weak self] row in
             guard let self else { return nil }
             if let item = self.results.paletteItem(at: row), case .application(let app) = item,
@@ -268,6 +274,7 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         super.viewDidLayout()
         let w = view.bounds.width, h = view.bounds.height, px = Theme.pixel(view)
         searchField.frame = NSRect(x: 0, y: 0, width: w, height: 64)
+        dragHandle.frame = NSRect(x: (w - 100) / 2, y: 0, width: 100, height: 14)
         topLine.frame = NSRect(x: 0, y: 64, width: w, height: px)
         filters.frame = NSRect(x: 0, y: 64 + px, width: w, height: 40)
         scopeButton.frame = NSRect(x: 18, y: 109 + px, width: 104, height: 24)
@@ -877,9 +884,10 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
         for control in [dialogHint, dialogPath, dialogCopyButton, dialogOrdinaryButton] as [NSView] { control.isHidden = !isDialogMode }
         guard isDialogMode else { view.needsLayout = true; return }
         let adapter = actionExecutor.dialog
-        let key = adapter.path == nil ? "dialog.manual" : adapter.status.localizationKey
-        if adapter.status == .manual, let file = adapter.fileToSelect { dialogHint.stringValue = L10n.text("dialog.manualFile", file.lastPathComponent) }
-        else { dialogHint.stringValue = L10n.text(key) }
+        if !session.contextAvailable {
+            dialogHint.stringValue = L10n.text("panel.contextUnavailable")
+        } else if adapter.status == .manual, let file = adapter.fileToSelect { dialogHint.stringValue = L10n.text("dialog.manualFile", file.lastPathComponent) }
+        else { dialogHint.stringValue = L10n.text(adapter.path == nil ? "dialog.manual" : adapter.status.localizationKey) }
         dialogHint.toolTip = dialogHint.stringValue
         dialogPath.stringValue = adapter.path?.path ?? L10n.text(session.context.mode == .save ? "dialog.saveHint" : "dialog.openHint")
         dialogPath.toolTip = dialogPath.stringValue
@@ -1130,9 +1138,20 @@ final class SearchViewController: NSViewController, NSWindowDelegate, NSMenuDele
             self.hideIfInactive()
         }
     }
-    private func hideIfInactive() {
-        if session.isActive && pendingOpen == nil && !actionExecutor.dialog.isNavigating && view.window?.isKeyWindow == false && !quickLook.isVisible && !menuTracking && !dragging && !actionModalActive { hidePanel?() }
+    private func draggingChanged(_ active: Bool) {
+        dragging = active
+        if !active { hideIfInactive() }
     }
+    func hideIfInactive() {
+        session.validateContext()
+        guard session.isActive, pendingOpen == nil, !actionExecutor.dialog.isNavigating,
+              view.window?.isKeyWindow == false, !quickLook.isVisible, !menuTracking, !dragging, !actionModalActive else { return }
+        if keepPanelOpen() { session.invalidateContext() }
+        else { hidePanel?() }
+    }
+    func windowDidMove(_ notification: Notification) { onPanelMove?() }
+    func windowDidResize(_ notification: Notification) { onPanelMove?() }
+    func windowWillClose(_ notification: Notification) { endSession() }
     func windowDidResignKey(_ notification: Notification) {
         // Quick Look visibility settles after the key-window transition.
         scheduleHideIfInactive()

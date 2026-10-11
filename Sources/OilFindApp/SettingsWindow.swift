@@ -18,6 +18,8 @@ final class SettingsModel: ObservableObject {
     private var coverageExplanation: CoverageExplanation?
     private let snapshot: Bool
     @Published var loginError: String?
+    @Published var panelKeepOpen: Bool
+    let panelPreferences: PanelPreferences
     @Published var dialogWorkflowsEnabled: Bool
     @Published var accessibilityGranted = false
     @Published var pinyinEnabled: Bool
@@ -49,8 +51,10 @@ final class SettingsModel: ObservableObject {
     private var keyMonitor: Any?
     private var timer: Timer?
 
-    init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard) {
+    init(snapshotStore: IndexStore? = nil, snapshot: Bool = false, languageDefaults: UserDefaults = .standard, panelPreferences: PanelPreferences? = nil) {
         self.snapshot = snapshot
+        self.panelPreferences = panelPreferences ?? (snapshot ? PanelPreferences() : .shared)
+        self.panelKeepOpen = self.panelPreferences.keepOpen
         self.favorites = snapshot ? FavoritesStore(url: nil) : .shared
         self.launcher = snapshot ? LauncherPreferences(url: nil) : .shared
         self.customActions = snapshot ? ActionDefinitions(url: nil) : .shared
@@ -137,6 +141,9 @@ final class SettingsModel: ObservableObject {
         } catch { loginError = error.localizedDescription }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         onContentChange?()
+    }
+    func setPanelKeepOpen(_ enabled: Bool) {
+        panelKeepOpen = enabled; panelPreferences.keepOpen = enabled
     }
     func setDialogWorkflows(_ enabled: Bool) {
         dialogWorkflowsEnabled = enabled
@@ -542,6 +549,10 @@ private struct SettingsForm: View {
                     Toggle(L10n.text("settings.pinyin"), isOn: Binding(get: { model.pinyinEnabled }, set: model.setPinyin))
                     hint(L10n.text("settings.pinyinHint"))
                 }
+            }
+            Section(L10n.text("panel.preferences")) {
+                Toggle(L10n.text("panel.keepOpen"), isOn: Binding(get: { model.panelKeepOpen }, set: model.setPanelKeepOpen))
+                hint(L10n.text("panel.hint"))
             }
             Section(L10n.text("dialog.settings")) {
                 Toggle(L10n.text("dialog.enabled"), isOn: Binding(get: { model.dialogWorkflowsEnabled }, set: model.setDialogWorkflows))

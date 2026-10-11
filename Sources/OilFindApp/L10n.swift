@@ -38,6 +38,10 @@ enum L10n {
         }
     }
     private static let strings: [String: (String, String)] = [
+        "panel.preferences": ("搜索面板", "Search Panel"),
+        "panel.keepOpen": ("失焦后保持打开", "Keep open when focus changes"),
+        "panel.hint": ("拖动顶部短横线移动面板，位置自动记忆。Escape、⌘W 或再次按快捷键可关闭。保持打开时，对话框场景在普通失焦或捕获两分钟后失效；重新唤起以捕获新场景。", "Drag the top handle to move the panel; its position is remembered. Escape, ⌘W, or the shortcut closes it. While kept open, dialog context expires on ordinary focus loss or two minutes after capture. Invoke again to capture a new context."),
+        "panel.contextUnavailable": ("原对话框场景已失效。请切回普通搜索，或重新用全局快捷键唤起。", "The original dialog context is unavailable. Switch to ordinary search or invoke the global shortcut again."),
         "usage.settings": ("使用历史", "Usage History"),
         "usage.enabled": ("记录本应用的使用历史", "Record usage in this app"),
         "usage.privacy": ("仅记录 Mistary 的动作，最多保留 1000 个目标。文件历史包含路径、书签和近期查询；网页仅保存关键字标识，不保存搜索正文或网址。自定义动作 recordsUsage 记录进程启动，退出结果另行报告。", "Only Mistary actions are recorded, for up to 1,000 targets. File history includes paths, bookmarks and recent queries. Web history stores keyword IDs without search text or URLs. Custom recordsUsage records process launch; exit results are reported separately."),

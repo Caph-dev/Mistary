@@ -36,6 +36,12 @@ final class SearchSession {
     private(set) var context = SearchContext.ordinary
     private(set) var isActive = true
     private(set) var directoryScope: URL? = nil
+    private(set) var contextAvailable = true
+    var contextLifetime: TimeInterval?
+    private var capturedAt: Date
+    private let now: () -> Date
+    var onContextUnavailable: (() -> Void)?
+    init(now: @escaping () -> Date = Date.init) { self.now = now; capturedAt = now() }
     var onInvalidate: (() -> Void)?
     var token: SearchSessionToken { SearchSessionToken(sessionID: sessionID, queryGeneration: queryGeneration, actionGeneration: actionGeneration) }
 
@@ -43,6 +49,7 @@ final class SearchSession {
         onInvalidate?()
         sessionID = UUID(); queryGeneration = 0; actionGeneration = 0
         invocationSource = source; self.context = context; directoryScope = nil; isActive = true
+        contextAvailable = true; capturedAt = now()
     }
     func setDirectoryScope(_ url: URL?) {
         directoryScope = url?.standardizedFileURL; queryChanged()
@@ -58,7 +65,22 @@ final class SearchSession {
     func queryChanged() { queryGeneration &+= 1; invalidateActions() }
     func invalidateActions() { actionGeneration &+= 1; onInvalidate?() }
     func end() { isActive = false; invalidateActions() }
-    func isCurrent(_ token: SearchSessionToken) -> Bool { isActive && self.token == token }
+    func isCurrent(_ token: SearchSessionToken) -> Bool {
+        validateContext()
+        return isActive && self.token == token && (contextAvailable || (context.mode != .open && context.mode != .save))
+    }
+    func validateContext() {
+        guard isActive, let lifetime = contextLifetime, now().timeIntervalSince(capturedAt) >= lifetime else { return }
+        invalidateContext()
+    }
+    func invalidateContext() {
+        guard isActive, contextAvailable, context.mode == .open || context.mode == .save else { return }
+        contextAvailable = false
+        // Drop all captured dialog authority without binding to a different foreground app.
+        context = SearchContext(mode: context.mode, target: nil, directoryScope: nil,
+                                recentFinderDirectory: context.recentFinderDirectory)
+        invalidateActions(); onContextUnavailable?()
+    }
     /// Future directory resolvers must submit against the context they captured.
     @discardableResult
     func submitContext(_ context: SearchContext, for token: SearchSessionToken) -> Bool {

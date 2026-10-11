@@ -71,6 +71,19 @@ private final class WindowFade: NSAnimation, NSAnimationDelegate {
     func animationDidEnd(_ animation: NSAnimation) { window?.alphaValue = endAlpha; completion?() }
 }
 
+final class PanelDragHandle: NSView {
+    var onDragging: ((Bool) -> Void)?
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func mouseDown(with event: NSEvent) {
+        onDragging?(true); defer { onDragging?(false) }
+        window?.performDrag(with: event)
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.tertiaryLabelColor.setFill()
+        NSBezierPath(roundedRect: NSRect(x: bounds.midX - 16, y: bounds.midY - 1.5, width: 32, height: 3), xRadius: 1.5, yRadius: 1.5).fill()
+    }
+}
+
 final class SearchPanel: NSPanel {
     let searchController: SearchViewController
     private(set) var hiding = false
@@ -80,15 +93,39 @@ final class SearchPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
     private let contextResolver: ContextResolving
-    init(snapshot: Bool = false, contextResolver: ContextResolving = ContextResolver()) {
+    let preferences: PanelPreferences
+    private let screens: () -> [PanelScreen]
+    private var screenObserver: NSObjectProtocol?
+    private var preferencesObserver: NSObjectProtocol?
+    private var contextTimer: Timer?
+    private var applyingFrame = false
+    init(snapshot: Bool = false, contextResolver: ContextResolving = ContextResolver(), preferences: PanelPreferences? = nil,
+         screens: @escaping () -> [PanelScreen] = { PanelScreen.current }) {
         self.contextResolver = contextResolver
+        self.preferences = preferences ?? (snapshot ? PanelPreferences() : .shared)
+        self.screens = screens
         searchController = SearchViewController(snapshot: snapshot)
         super.init(contentRect: NSRect(origin: .zero, size: Theme.panelSize), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         level = .floating; collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        isMovable = false; hidesOnDeactivate = false; isOpaque = false; backgroundColor = .clear; hasShadow = true
+        isMovable = true; isMovableByWindowBackground = false; hidesOnDeactivate = false; isOpaque = false; backgroundColor = .clear; hasShadow = true
         isReleasedWhenClosed = false
         contentViewController = searchController; delegate = searchController
         searchController.hidePanel = { [weak self] in self?.hide(source: .interaction) }
+        searchController.keepPanelOpen = { [weak self] in self?.preferences.keepOpen == true }
+        searchController.onPanelMove = { [weak self] in self?.rememberPlacement() }
+        preferencesObserver = NotificationCenter.default.addObserver(forName: PanelPreferences.changed, object: self.preferences, queue: .main) { [weak self] _ in
+            self?.applyPreferences()
+            self?.searchController.hideIfInactive()
+        }
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.isVisible, !self.hiding else { return }
+            self.restorePlacement()
+        }
+        contextTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, self.isVisible, !self.hiding else { return }
+            self.searchController.session.validateContext()
+        }
+        applyPreferences()
         if let layer = contentView?.layer {
             let frame = layer.frame; layer.anchorPoint = CGPoint(x: 0.5, y: 0.5); layer.frame = frame
         }
@@ -99,7 +136,8 @@ final class SearchPanel: NSPanel {
     }
     func show(source: PanelSource = .interaction, captureContext: Bool = true) {
         let presentation = UUID(); presentationGeneration = presentation
-        if !isVisible || hiding || !searchController.session.isActive {
+        if !isVisible || hiding || !searchController.session.isActive ||
+            (preferences.keepOpen && !isKeyWindow && source.capturesExternalContext) {
             searchController.endSession()
             if captureContext && source.capturesExternalContext {
                 contextResolver.capture(source: source) { [weak self] context in
@@ -113,16 +151,10 @@ final class SearchPanel: NSPanel {
         }
         present(source: source)
     }
-    func resumeDialog() { if searchController.session.isActive { present(source: .interaction) } }
-    private func present(source: PanelSource) {
+    func resumeDialog() { if searchController.session.isActive { present(source: .interaction, refresh: false) } }
+    private func present(source: PanelSource, refresh: Bool = true) {
         let cold = !isVisible
-        if cold {
-            let mouse = NSEvent.mouseLocation
-            guard let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main else { return }
-            let size = NSSize(width: min(800, screen.visibleFrame.width - 80), height: min(560, screen.visibleFrame.height - 120))
-            let frame = NSRect(x: (screen.frame.midX - size.width / 2).rounded(), y: (screen.frame.midY - size.height / 2).rounded(), width: size.width, height: size.height)
-            setFrame(frame, display: false)
-        }
+        if cold, !restorePlacement() { return }
         AppLog.logger.info("panel show source=\(source.rawValue, privacy: .public)")
         animationGeneration += 1; hiding = false; fade?.stop()
         contentView?.layoutSubtreeIfNeeded()
@@ -135,7 +167,8 @@ final class SearchPanel: NSPanel {
             Theme.Motion.animate(layer, "transform", to: NSValue(caTransform3D: CATransform3DIdentity), using: Theme.Motion.reduced ? nil : Theme.Motion.panelIn)
         }
         orderFrontRegardless(); makeKey()
-        searchController.panelWillShow(); searchController.searchField.focus(selectAll: true)
+        if refresh { searchController.panelWillShow() }
+        searchController.searchField.focus(selectAll: refresh)
         fade = WindowFade(window: self, target: 1, duration: Theme.Motion.reduced ? Theme.Motion.reducedFade : Theme.Motion.panelInFade, curve: .easeOut)
         fade?.start()
     }
@@ -155,6 +188,23 @@ final class SearchPanel: NSPanel {
             self.orderOut(nil); self.searchController.quickLook.close(); self.hiding = false
         }
         fade?.start()
+    }
+    private func applyPreferences() { searchController.session.contextLifetime = preferences.keepOpen ? 120 : nil }
+    @discardableResult
+    private func restorePlacement() -> Bool {
+        guard let frame = preferences.restoredFrame(screens: screens(), mouse: NSEvent.mouseLocation) else { return false }
+        applyingFrame = true; setFrame(frame, display: false); applyingFrame = false
+        return true
+    }
+    func rememberPlacement() {
+        guard !applyingFrame else { return }
+        preferences.save(frame: frame, screens: screens())
+    }
+    override func close() { hide(); super.close() }
+    deinit {
+        contextTimer?.invalidate()
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        if let preferencesObserver { NotificationCenter.default.removeObserver(preferencesObserver) }
     }
     override func keyDown(with event: NSEvent) {
         if !searchController.handleKey(event) { super.keyDown(with: event) }
